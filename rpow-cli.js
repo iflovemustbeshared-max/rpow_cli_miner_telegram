@@ -9,6 +9,27 @@ const readline = require("readline");
 const { spawn } = require("child_process");
 const { Worker } = require("worker_threads");
 
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegramAlert(message) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: "Markdown",
+      }),
+    });
+  } catch (err) {
+    console.error("Failed to send Telegram alert:", err.message);
+  }
+}
+
 const DEFAULT_SITE_ORIGIN = "https://rpow2.com";
 const DEFAULT_API_ORIGIN = "https://api.rpow2.com";
 const DEFAULT_INDEX = path.join(__dirname, "index.js");
@@ -798,6 +819,7 @@ async function main() {
         client.save();
         log("success", "mint/claim accepted", result);
         log("success", "mint progress", { minted, target, remaining: Math.max(0, target - minted) });
+        await sendTelegramAlert(`✅ *Berhasil Minting, Master!*\n\n*Detail:* ${JSON.stringify(result, null, 2)}\n*Progress:* ${minted}/${target}`);
       } catch (err) {
         if (err.code === "UNAUTHORIZED") {
           log("warn", "session invalid; rerun login/complete-login, then rerun mine to resume");
@@ -835,7 +857,8 @@ Options:
   --verbose`);
 }
 
-main().catch((err) => {
+  main().catch(async (err) => {
   log("error", err.message, { code: err.code, status: err.status });
+  await sendTelegramAlert(`❌ *Waduh Master, Ada Error!*\n\n*Pesan:* ${err.message}\n*Code:* ${err.code || "N/A"}`);
   process.exitCode = 1;
 });
