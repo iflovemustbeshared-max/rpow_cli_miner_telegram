@@ -288,7 +288,7 @@ class RpowClient {
     this.siteOrigin = options.siteOrigin;
     this.stateFile = options.stateFile;
     this.state = loadState(this.stateFile);
-    this.timeoutMs = Number(options.timeoutMs || 20000);
+    this.timeoutMs = Number(process.env.RPOW_TIMEOUT || options.timeoutMs || 20000);
     this.maxRetries = Number(options.retries || 5);
   }
 
