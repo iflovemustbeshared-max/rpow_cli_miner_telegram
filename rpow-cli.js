@@ -57,18 +57,25 @@ async function findMagicLinkInGmail() {
 }
 
 async function sendTelegramAlert(message) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("Telegram notification skipped: Token or Chat ID missing.");
+    return;
+  }
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: TELEGRAM_CHAT_ID,
         text: message,
-        parse_mode: "Markdown",
+        parse_mode: "HTML", // Switch to HTML for better stability with special characters
       }),
     });
+    if (!res.ok) {
+      const errorData = await res.json();
+      console.error("Telegram API Error:", JSON.stringify(errorData));
+    }
   } catch (err) {
     console.error("Failed to send Telegram alert:", err.message);
   }
@@ -870,11 +877,11 @@ async function main() {
         client.save();
         log("success", "mint/claim accepted", result);
         log("success", "mint progress", { minted, target, remaining: Math.max(0, target - minted) });
-        await sendTelegramAlert(`✅ *Berhasil Minting, Master!*\n\n*Detail:* ${JSON.stringify(result, null, 2)}\n*Progress:* ${minted}/${target}`);
+        await sendTelegramAlert(`✅ <b>Berhasil Minting, Master!</b>\n\n<b>Detail:</b> <pre>${JSON.stringify(result, null, 2)}</pre>\n<b>Progress:</b> ${minted}/${target}`);
       } catch (err) {
         if (err.code === "UNAUTHORIZED") {
           log("warn", "session invalid; attempting auto-login via Gmail API...");
-          await sendTelegramAlert(`🔄 *Sesi Berakhir, Master!*\n\nSesi Master sudah tidak valid. Saya sedang mencoba login otomatis via Gmail API...`);
+          await sendTelegramAlert(`🔄 <b>Sesi Berakhir, Master!</b>\n\nSesi Master sudah tidak valid. Saya sedang mencoba login otomatis via Gmail API...`);
           
           try {
             const email = client.state.email || process.env.RPOW_EMAIL;
@@ -896,11 +903,11 @@ async function main() {
             await client.followMagicLink(magicLink);
             const me = await client.api("GET", "/me");
             log("success", "auto-login successful", me);
-            await sendTelegramAlert(`✅ *Auto-Login Berhasil, Master!*\n\nSesi telah diperbarui otomatis. Mining dilanjutkan!`);
+            await sendTelegramAlert(`✅ <b>Auto-Login Berhasil, Master!</b>\n\nSesi telah diperbarui otomatis. Mining dilanjutkan!`);
             return; // Retry the failed request
           } catch (loginErr) {
             log("error", "auto-login failed", { error: loginErr.message });
-            await sendTelegramAlert(`❌ *Auto-Login Gagal, Master!*\n\n*Pesan:* ${loginErr.message}\nMiner akan mencoba lagi dalam 1 jam.`);
+            await sendTelegramAlert(`❌ <b>Auto-Login Gagal, Master!</b>\n\n<b>Pesan:</b> ${loginErr.message}\nMiner akan mencoba lagi dalam 1 jam.`);
             await sleep(3600000);
             throw err;
           }
@@ -939,6 +946,6 @@ Options:
 
   main().catch(async (err) => {
   log("error", err.message, { code: err.code, status: err.status });
-  await sendTelegramAlert(`❌ *Waduh Master, Ada Error!*\n\n*Pesan:* ${err.message}\n*Code:* ${err.code || "N/A"}`);
+  await sendTelegramAlert(`❌ <b>Waduh Master, Ada Error!</b>\n\n<b>Pesan:</b> ${err.message}\n<b>Code:</b> ${err.code || "N/A"}`);
   process.exitCode = 1;
 });
