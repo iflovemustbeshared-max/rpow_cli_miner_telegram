@@ -160,6 +160,13 @@ function isTransientNetworkError(err) {
 }
 
 function loadState(file) {
+  if (process.env.RPOW_STATE_JSON) {
+    try {
+      return JSON.parse(process.env.RPOW_STATE_JSON);
+    } catch (err) {
+      log("error", "Failed to parse RPOW_STATE_JSON environment variable", { error: err.message });
+    }
+  }
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
