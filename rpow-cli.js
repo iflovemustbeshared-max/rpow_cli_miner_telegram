@@ -12,6 +12,50 @@ const { Worker } = require("worker_threads");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID;
+const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
+
+async function getGmailAccessToken() {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: GMAIL_CLIENT_ID,
+      client_secret: GMAIL_CLIENT_SECRET,
+      refresh_token: GMAIL_REFRESH_TOKEN,
+      grant_type: "refresh_token",
+    }),
+  });
+  const data = await res.json();
+  return data.access_token;
+}
+
+async function findMagicLinkInGmail() {
+  if (!GMAIL_CLIENT_ID || !GMAIL_CLIENT_SECRET || !GMAIL_REFRESH_TOKEN) return null;
+  try {
+    const accessToken = await getGmailAccessToken();
+    const listRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages?q=from:rpow2.com&maxResults=5", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const listData = await listRes.json();
+    if (!listData.messages) return null;
+
+    for (const msg of listData.messages) {
+      const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const msgData = await msgRes.json();
+      const body = Buffer.from(msgData.payload.parts?.[0]?.body?.data || msgData.payload.body?.data || "", "base64").toString();
+      const match = body.match(/https:\/\/api\.rpow2\.com\/auth\/confirm\?token=[a-zA-Z0-9._-]+/);
+      if (match) return match[0];
+    }
+  } catch (err) {
+    console.error("Gmail API Error:", err.message);
+  }
+  return null;
+}
+
 async function sendTelegramAlert(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -829,8 +873,37 @@ async function main() {
         await sendTelegramAlert(`✅ *Berhasil Minting, Master!*\n\n*Detail:* ${JSON.stringify(result, null, 2)}\n*Progress:* ${minted}/${target}`);
       } catch (err) {
         if (err.code === "UNAUTHORIZED") {
-          log("warn", "session invalid; rerun login/complete-login, then rerun mine to resume");
-          throw err;
+          log("warn", "session invalid; attempting auto-login via Gmail API...");
+          await sendTelegramAlert(`🔄 *Sesi Berakhir, Master!*\n\nSesi Master sudah tidak valid. Saya sedang mencoba login otomatis via Gmail API...`);
+          
+          try {
+            const email = client.state.email || process.env.RPOW_EMAIL;
+            if (!email) throw new Error("Email not found in state or environment");
+            
+            await client.api("POST", "/auth/request", { email });
+            log("info", "magic link requested, waiting for email...");
+            
+            let magicLink = null;
+            for (let i = 0; i < 12; i++) { // Wait up to 2 minutes
+              await sleep(10000);
+              magicLink = await findMagicLinkInGmail();
+              if (magicLink) break;
+              log("info", `waiting for email... (${(i + 1) * 10}s)`);
+            }
+            
+            if (!magicLink) throw new Error("Magic link not found in Gmail after 2 minutes");
+            
+            await client.followMagicLink(magicLink);
+            const me = await client.api("GET", "/me");
+            log("success", "auto-login successful", me);
+            await sendTelegramAlert(`✅ *Auto-Login Berhasil, Master!*\n\nSesi telah diperbarui otomatis. Mining dilanjutkan!`);
+            return; // Retry the failed request
+          } catch (loginErr) {
+            log("error", "auto-login failed", { error: loginErr.message });
+            await sendTelegramAlert(`❌ *Auto-Login Gagal, Master!*\n\n*Pesan:* ${loginErr.message}\nMiner akan mencoba lagi dalam 1 jam.`);
+            await sleep(3600000);
+            throw err;
+          }
         }
         log("warn", "mint failed; dropping challenge and continuing with a fresh one", { error: err.message, code: err.code, status: err.status });
         client.state.challenge = null;
