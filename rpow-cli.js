@@ -759,12 +759,11 @@ async function mineSolutionNative(challenge, state, stateFile, logEveryMs, worke
   return new Promise((resolve, reject) => {
     const started = Date.now();
     const args = [
-      "--challenge", challenge.challenge_id,
       "--prefix", challenge.nonce_prefix,
-      "--bits", String(challenge.difficulty_bits),
-      "--nonce", state.mining?.nonce || "0",
+      "--difficulty", String(challenge.difficulty_bits),
+      "--start", state.mining?.nonce || "0",
       "--workers", String(workers),
-      "--log-every-ms", String(logEveryMs),
+      "--progress-ms", String(logEveryMs),
     ];
     const child = spawn(NATIVE_MINER, args, { windowsHide: true });
     let solution = null;
@@ -778,7 +777,7 @@ async function mineSolutionNative(challenge, state, stateFile, logEveryMs, worke
         if (!line) continue;
         const msg = tryJson(line);
         if (msg) {
-          if (msg.type === "solution") {
+          if (msg.type === "found" || msg.type === "solution") {
             solution = msg;
             child.kill();
           } else if (msg.type === "progress") {
@@ -849,7 +848,7 @@ async function mineSolutionGpu(challenge, state, stateFile, logEveryMs, workers,
         if (!line) continue;
         const msg = tryJson(line);
         if (msg) {
-          if (msg.type === "solution") {
+          if (msg.type === "found" || msg.type === "solution") {
             solution = msg;
             child.kill();
           } else if (msg.type === "progress") {
