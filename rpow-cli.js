@@ -997,7 +997,12 @@ async function main() {
         await client.api("GET", "/me");
         break;
       } catch (err) {
-        if (err.code === "UNAUTHORIZED") throw err;
+        if (err.code === "UNAUTHORIZED") {
+          log("info", "No valid session on startup, attempting auto-login...");
+          // This will trigger the auto-login logic in the request method's catch block
+          await client.request("GET", "/me");
+          break;
+        }
         if (!(err.retryable || isTransientNetworkError(err))) throw err;
         const delay = Math.max(5000, Math.min(Number(err.retryAfterMs || 0) || 0, 60000));
         log("warn", "startup request failed; waiting before retrying mine loop", {
