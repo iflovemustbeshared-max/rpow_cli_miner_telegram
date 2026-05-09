@@ -587,6 +587,7 @@ function nodeRequest(url, { method, headers, body, proxy, signal, timeout }) {
 class RpowClient {
   constructor(options = {}) {
     this.apiOrigin = options.apiOrigin || DEFAULT_API_ORIGIN;
+    this.siteOrigin = options.siteOrigin || DEFAULT_SITE_ORIGIN;
     this.stateFile = options.stateFile || DEFAULT_STATE;
     this.state = loadState(this.stateFile);
     this.proxy = parseProxySpec(options.proxy || process.env.RPOW_PROXY);
