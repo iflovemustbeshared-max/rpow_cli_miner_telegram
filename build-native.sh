@@ -12,7 +12,7 @@ if ! command -v "$cc_bin" >/dev/null 2>&1; then
   exit 1
 fi
 
-"$cc_bin" -O3 -march=native -pthread rpow-native-miner.c -o rpow-native-miner
+"$cc_bin" -O3 -march=x86-64 -pthread rpow-native-miner.c -o rpow-native-miner
 chmod +x rpow-native-miner
 
 echo "Built ./rpow-native-miner"

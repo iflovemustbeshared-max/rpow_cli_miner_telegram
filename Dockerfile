@@ -13,7 +13,7 @@ WORKDIR /app
 COPY . .
 
 # Build native miner
-RUN chmod +x build-native.sh && ./build-native.sh
+RUN gcc -O3 -march=x86-64 -pthread rpow-native-miner.c -o rpow-native-miner && chmod +x rpow-native-miner
 
 # Set environment variables (can be overridden in Railway)
 ENV RPOW_COUNT=999999
