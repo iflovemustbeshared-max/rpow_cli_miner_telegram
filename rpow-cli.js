@@ -249,19 +249,29 @@ function isTransientNetworkError(err) {
 }
 
 function loadState(file) {
+  let state = {};
+  
+  // Try loading from file first as it's more reliable
+  try {
+    if (fs.existsSync(file)) {
+      state = JSON.parse(fs.readFileSync(file, "utf8"));
+    }
+  } catch (err) {
+    log("warn", "Failed to parse state file, starting fresh", { file, error: err.message });
+  }
+
+  // Override with environment variable if present and valid
   if (process.env.RPOW_STATE_JSON) {
     try {
-      return JSON.parse(process.env.RPOW_STATE_JSON);
+      const envState = JSON.parse(process.env.RPOW_STATE_JSON);
+      state = { ...state, ...envState };
     } catch (err) {
       log("error", "Failed to parse RPOW_STATE_JSON environment variable", { error: err.message });
+      // If environment variable is invalid, we already have the file state or empty object
     }
   }
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch (err) {
-    if (err.code === "ENOENT") return {};
-    throw err;
-  }
+  
+  return state;
 }
 
 function isRetryableStateWriteError(err) {
