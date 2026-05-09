@@ -602,7 +602,16 @@ class RpowClient {
     const url = assertSafeUrl(path, this.apiOrigin);
     const headers = {
       ...options.headers,
-      "User-Agent": "rpow-cli/1.0",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "application/json, text/plain, */*",
+      "Origin": this.siteOrigin,
+      "Referer": `${this.siteOrigin}/`,
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-site",
     };
     const cookie = cookieHeader(this.state.cookies);
     if (cookie) headers.Cookie = cookie;
