@@ -62,7 +62,6 @@ async function findMagicLinkInGmail() {
 
 async function sendTelegramAlert(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log("Telegram notification skipped: Token or Chat ID missing.");
     return;
   }
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -73,7 +72,7 @@ async function sendTelegramAlert(message) {
       body: JSON.stringify({
         chat_id: TELEGRAM_CHAT_ID,
         text: message,
-        parse_mode: "HTML", // Switch to HTML for better stability with special characters
+        parse_mode: "HTML",
       }),
     });
     if (!res.ok) {
@@ -82,6 +81,38 @@ async function sendTelegramAlert(message) {
     }
   } catch (err) {
     console.error("Failed to send Telegram alert:", err.message);
+  }
+}
+
+async function checkTelegramUpdates(client, target, minted) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.ok && data.result.length > 0) {
+      const lastUpdate = data.result[data.result.length - 1];
+      const message = lastUpdate.message;
+      if (!message || !message.text) return;
+
+      // Simple rate limiting or state to avoid processing same message
+      if (client.lastTelegramUpdateId === lastUpdate.update_id) return;
+      client.lastTelegramUpdateId = lastUpdate.update_id;
+
+      const text = message.text.toLowerCase();
+      if (text === "/status") {
+        const me = await client.api("GET", "/me").catch(() => ({ email: "Unknown", balance: 0 }));
+        await sendTelegramAlert(`📊 <b>Status Miner:</b>\n\n<b>Email:</b> ${me.email}\n<b>Balance:</b> ${me.balance}\n<b>Progress:</b> ${minted}/${target}`);
+      } else if (text === "/stop") {
+        await sendTelegramAlert("🛑 <b>Mining dihentikan oleh Master!</b>");
+        process.exit(0);
+      } else if (text === "/balance") {
+        const me = await client.api("GET", "/me").catch(() => ({ balance: 0 }));
+        await sendTelegramAlert(`💰 <b>Balance Saat Ini:</b> ${me.balance} RPOW`);
+      }
+    }
+  } catch (err) {
+    // Silently fail for background checks
   }
 }
 
@@ -296,21 +327,22 @@ function printApiMap(discovered) {
 function assertSafeUrl(rawUrl, apiOrigin) {
   const url = new URL(rawUrl, apiOrigin);
   if (!["https:", "http:"].includes(url.protocol)) throw new Error(`blocked non-http URL: ${rawUrl}`);
-  if (!SAFE_HOSTS.has(url.hostname)) throw new Error(`blocked host outside site/API allowlist: ${url.hostname}`);
+  if (!SAFE_HOSTS.has(url.hostname)) throw new Error(`blocked non-RPOW host: ${url.hostname}`);
   return url;
 }
 
-function cookieHeader(cookies = {}) {
-  return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+function cookieHeader(cookies) {
+  if (!cookies) return null;
+  const parts = Object.entries(cookies).map(([k, v]) => `${k}=${v}`);
+  return parts.length > 0 ? parts.join("; ") : null;
 }
 
-function storeSetCookies(state, setCookieHeaders) {
-  if (!setCookieHeaders || setCookieHeaders.length === 0) return;
-  state.cookies ||= {};
-  for (const header of setCookieHeaders) {
-    const first = header.split(";", 1)[0];
+function storeSetCookies(state, setCookies) {
+  if (!state.cookies) state.cookies = {};
+  for (const header of setCookies) {
+    const first = header.split(";")[0];
     const eq = first.indexOf("=");
-    if (eq <= 0) continue;
+    if (eq < 0) continue;
     const name = first.slice(0, eq).trim();
     const value = first.slice(eq + 1).trim();
     if (value) state.cookies[name] = value;
@@ -703,427 +735,205 @@ function nonceLe64(nonce) {
   return out;
 }
 
-function trailingZeroBits(buf) {
-  let bits = 0;
-  for (let i = buf.length - 1; i >= 0; i -= 1) {
-    const byte = buf[i];
-    if (byte === 0) {
-      bits += 8;
-      continue;
-    }
-    for (let bit = 0; bit < 8; bit += 1) {
-      if ((byte & (1 << bit)) === 0) bits += 1;
-      else return bits;
-    }
-  }
-  return bits;
-}
-
 function defaultWorkerCount() {
-  return Math.max(1, Math.min(os.cpus().length - 1, os.cpus().length, 8));
+  return Math.max(1, os.cpus().length - 1);
 }
 
-function mineSolutionSingleThread(challenge, state, stateFile, logEveryMs) {
-  const prefix = hexToBytes(challenge.nonce_prefix);
-  const difficulty = Number(challenge.difficulty_bits);
-  const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
-  const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : null;
-  let nonce = BigInt(state.mining?.nonce || "0");
-  let hashes = BigInt(state.mining?.hashes || "0");
-  const started = Date.now();
-  let lastLog = started;
-  while (true) {
-    if (cutoffAt && Date.now() >= cutoffAt) {
-      const err = new Error("challenge expired before a solution was found");
-      err.code = "CHALLENGE_EXPIRED";
-      err.retryable = true;
-      throw err;
-    }
-    const digest = crypto.createHash("sha256").update(prefix).update(nonceLe64(nonce)).digest();
-    if (trailingZeroBits(digest) >= difficulty) {
-      state.mining = { ...state.mining, nonce: nonce.toString(), hashes: hashes.toString(), found_at: new Date().toISOString() };
-      saveState(stateFile, state);
-      return { solution_nonce: nonce.toString(), hashes: hashes.toString(), digest: digest.toString("hex") };
-    }
-    nonce += 1n;
-    hashes += 1n;
-    const now = Date.now();
-    if (now - lastLog >= logEveryMs) {
-      const seconds = Math.max(1, (now - started) / 1000);
-      const rate = Number(hashes) / seconds;
-      state.mining = { challenge_id: challenge.challenge_id, nonce: nonce.toString(), hashes: hashes.toString(), difficulty_bits: difficulty };
-      saveState(stateFile, state);
-      log("info", "mining progress", {
-        hashes: hashes.toString(),
-        nonce: nonce.toString(),
-        rate_mhs: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-        rate_hps: Math.round(rate),
-      });
-      lastLog = now;
-    }
-  }
-}
-
-function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workerCount) {
-  if (workerCount <= 1) return Promise.resolve(mineSolutionSingleThread(challenge, state, stateFile, logEveryMs));
-
+function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workers) {
   return new Promise((resolve, reject) => {
-    const difficulty = Number(challenge.difficulty_bits);
-    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
-    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : null;
-    const startNonce = BigInt(state.mining?.nonce || "0");
     const started = Date.now();
-    const workers = [];
-    const workerStats = new Map();
-    let settled = false;
-    let lastSavedNonce = startNonce;
+    const active = new Set();
+    let solution = null;
+    let totalHashes = BigInt(state.mining?.hashes || "0");
+    let lastLog = started;
 
     function cleanup() {
-      for (const worker of workers) worker.terminate().catch(() => {});
+      for (const w of active) w.terminate();
+      active.clear();
     }
 
-    function totalHashes() {
-      let total = 0n;
-      for (const stats of workerStats.values()) total += BigInt(stats.hashes || "0");
-      return total;
-    }
-
-    function maxNonce() {
-      let max = lastSavedNonce;
-      for (const stats of workerStats.values()) {
-        if (!stats.nonce) continue;
-        const n = BigInt(stats.nonce);
-        if (n > max) max = n;
+    function onMessage(w, msg) {
+      if (msg.type === "solution") {
+        solution = msg;
+        const elapsed = Date.now() - started;
+        cleanup();
+        resolve({
+          ...msg,
+          hashes: (totalHashes + BigInt(msg.hashes)).toString(),
+          speed: Math.round(Number(totalHashes + BigInt(msg.hashes)) / (elapsed / 1000)),
+          elapsed_ms: elapsed,
+        });
+        return;
       }
-      return max;
-    }
-
-    const progressTimer = setInterval(() => {
-      if (settled) return;
-      const hashes = totalHashes();
-      const seconds = Math.max(1, (Date.now() - started) / 1000);
-      const rate = Number(hashes) / seconds;
-      lastSavedNonce = maxNonce();
-      state.mining = {
-        challenge_id: challenge.challenge_id,
-        nonce: lastSavedNonce.toString(),
-        hashes: hashes.toString(),
-        difficulty_bits: difficulty,
-        workers: workerCount,
-      };
-      saveState(stateFile, state);
-      log("info", "mining progress", {
-        hashes: hashes.toString(),
-        nonce: lastSavedNonce.toString(),
-        workers: workerCount,
-        rate_mhs: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-        rate_hps: Math.round(rate),
-      });
-    }, logEveryMs);
-
-    for (let i = 0; i < workerCount; i += 1) {
-      const worker = new Worker(MINER_WORKER, {
-        workerData: {
-          noncePrefix: challenge.nonce_prefix,
-          difficultyBits: difficulty,
-          startNonce: (startNonce + BigInt(i)).toString(),
-          stride: String(workerCount),
-          cutoffAt,
-          progressEveryMs: Math.max(500, Math.floor(logEveryMs / 2)),
-        },
-      });
-      workers.push(worker);
-      workerStats.set(i, { hashes: "0", nonce: (startNonce + BigInt(i)).toString() });
-
-      worker.on("message", (message) => {
-        if (settled) return;
-        if (message.hashes !== undefined || message.nonce !== undefined) {
-          workerStats.set(i, {
-            hashes: message.hashes ?? workerStats.get(i)?.hashes ?? "0",
-            nonce: message.nonce ?? workerStats.get(i)?.nonce,
+      if (msg.type === "progress") {
+        totalHashes += BigInt(msg.hashes);
+        const now = Date.now();
+        if (now - lastLog >= logEveryMs) {
+          const elapsed = now - started;
+          log("info", "mining progress", {
+            hashes: totalHashes.toString(),
+            speed: Math.round(Number(totalHashes) / (elapsed / 1000)),
+            elapsed_ms: elapsed,
           });
-        }
-        if (message.type === "found") {
-          settled = true;
-          clearInterval(progressTimer);
-          cleanup();
-          const hashes = totalHashes();
-          const seconds = Math.max(0.001, (Date.now() - started) / 1000);
-          const rate = Number(hashes) / seconds;
+          lastLog = now;
           state.mining = {
             ...state.mining,
-            nonce: message.solution_nonce,
-            hashes: hashes.toString(),
-            found_at: new Date().toISOString(),
-            workers: workerCount,
+            nonce: msg.nonce,
+            hashes: totalHashes.toString(),
           };
           saveState(stateFile, state);
-          resolve({
-            solution_nonce: message.solution_nonce,
-            hashes: hashes.toString(),
-            digest: message.digest,
-            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-            elapsed_ms: Date.now() - started,
-          });
         }
-        if (message.type === "expired") {
-          settled = true;
-          clearInterval(progressTimer);
-          cleanup();
-          const err = new Error("challenge expired before a solution was found");
-          err.code = "CHALLENGE_EXPIRED";
-          err.retryable = true;
-          reject(err);
-        }
-      });
+      }
+    }
 
-      worker.on("error", (err) => {
-        if (settled) return;
-        settled = true;
-        clearInterval(progressTimer);
-        cleanup();
-        reject(err);
+    for (let i = 0; i < workers; i += 1) {
+      const w = new Worker(MINER_WORKER, {
+        workerData: {
+          challenge_id: challenge.challenge_id,
+          nonce_prefix: challenge.nonce_prefix,
+          difficulty_bits: challenge.difficulty_bits,
+          start_nonce: (BigInt(state.mining?.nonce || "0") + BigInt(i)).toString(),
+          step: BigInt(workers).toString(),
+        },
       });
-
-      worker.on("exit", (code) => {
-        if (!settled && code !== 0) {
-          settled = true;
-          clearInterval(progressTimer);
+      w.on("message", (msg) => onMessage(w, msg));
+      w.on("error", (err) => { cleanup(); reject(err); });
+      w.on("exit", (code) => {
+        active.delete(w);
+        if (code !== 0 && !solution) {
           cleanup();
           reject(new Error(`miner worker exited with code ${code}`));
         }
       });
+      active.add(w);
     }
   });
 }
 
-function mineSolutionNative(challenge, state, stateFile, logEveryMs, workerCount) {
+async function mineSolutionNative(challenge, state, stateFile, logEveryMs, workers) {
   if (!fs.existsSync(NATIVE_MINER)) {
     throw new Error(`native miner not built: ${NATIVE_MINER}`);
   }
   return new Promise((resolve, reject) => {
-    const difficulty = Number(challenge.difficulty_bits);
-    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
-    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : 0;
-    const startNonce = BigInt(state.mining?.nonce || "0");
     const started = Date.now();
-    let settled = false;
-    let stderr = "";
-
-    const child = spawn(NATIVE_MINER, [
+    const args = [
+      "--challenge", challenge.challenge_id,
       "--prefix", challenge.nonce_prefix,
-      "--difficulty", String(difficulty),
-      "--workers", String(workerCount),
-      "--start", startNonce.toString(),
-      "--cutoff-ms", String(cutoffAt || 0),
-      "--progress-ms", String(logEveryMs),
-    ], { windowsHide: true });
-
+      "--bits", String(challenge.difficulty_bits),
+      "--nonce", state.mining?.nonce || "0",
+      "--workers", String(workers),
+      "--log-every-ms", String(logEveryMs),
+    ];
+    const child = spawn(NATIVE_MINER, args, { windowsHide: true });
+    let solution = null;
     let buffer = "";
+
     child.stdout.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
+      buffer += chunk.toString();
       while (buffer.includes("\n")) {
-        const idx = buffer.indexOf("\n");
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
+        const line = buffer.slice(0, buffer.indexOf("\n")).trim();
+        buffer = buffer.slice(buffer.indexOf("\n") + 1);
         if (!line) continue;
-        let message;
-        try {
-          message = JSON.parse(line);
-        } catch {
+        const msg = tryJson(line);
+        if (msg) {
+          if (msg.type === "solution") {
+            solution = msg;
+          } else if (msg.type === "progress") {
+            state.mining = { ...state.mining, nonce: msg.nonce, hashes: msg.hashes };
+            saveState(stateFile, state);
+          }
+        } else {
           log("warn", "native miner emitted non-json line", { line });
-          continue;
-        }
-        if (message.type === "progress") {
-          const hashes = BigInt(message.hashes || "0");
-          const seconds = Math.max(1, (Date.now() - started) / 1000);
-          const rate = Number(hashes) / seconds;
-          state.mining = {
-            challenge_id: challenge.challenge_id,
-            nonce: message.nonce,
-            hashes: hashes.toString(),
-            difficulty_bits: difficulty,
-            workers: workerCount,
-            engine: "native",
-          };
-          saveState(stateFile, state);
-          log("info", "mining", {
-            hashes: hashes.toString(),
-            nonce: message.nonce,
-            workers: workerCount,
-            engine: "native",
-            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-          });
-        }
-        if (message.type === "found") {
-          settled = true;
-          const hashes = BigInt(message.hashes || "0");
-          const seconds = Math.max(0.001, (Date.now() - started) / 1000);
-          const rate = Number(hashes) / seconds;
-          state.mining = {
-            ...state.mining,
-            nonce: message.solution_nonce,
-            hashes: message.hashes,
-            found_at: new Date().toISOString(),
-            workers: workerCount,
-            engine: "native",
-          };
-          saveState(stateFile, state);
-          resolve({
-            solution_nonce: message.solution_nonce,
-            hashes: message.hashes,
-            digest: message.digest,
-            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-            elapsed_ms: Date.now() - started,
-          });
-        }
-        if (message.type === "expired") {
-          settled = true;
-          const err = new Error("challenge expired before a solution was found");
-          err.code = "CHALLENGE_EXPIRED";
-          err.retryable = true;
-          reject(err);
         }
       }
     });
 
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
 
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (settled) return;
-      if (code === 0) return;
-      reject(new Error(`native miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+    child.on("close", (code) => {
+      if (code === 0 && solution) {
+        const elapsed = Date.now() - started;
+        resolve({
+          ...solution,
+          speed: Math.round(Number(solution.hashes) / (elapsed / 1000)),
+          elapsed_ms: elapsed,
+        });
+      } else {
+        reject(new Error(`native miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+      }
     });
   });
 }
 
-function mineSolutionGpu(challenge, state, stateFile, logEveryMs, workerCount, args = {}) {
+async function mineSolutionGpu(challenge, state, stateFile, logEveryMs, workers, args) {
   if (!fs.existsSync(GPU_MINER)) {
     throw new Error(`gpu miner not built: ${GPU_MINER}`);
   }
   return new Promise((resolve, reject) => {
-    const difficulty = Number(challenge.difficulty_bits);
-    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
-    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : 0;
-    const startNonce = BigInt(state.mining?.nonce || "0");
     const started = Date.now();
-    let settled = false;
-    let stderr = "";
-
-    const gpuBatchSize = Number(args["gpu-batch"] || Math.max(65536, workerCount * 262144));
     const minerArgs = [
+      "--challenge", challenge.challenge_id,
       "--prefix", challenge.nonce_prefix,
-      "--difficulty", String(difficulty),
-      "--start", startNonce.toString(),
-      "--cutoff-ms", String(cutoffAt || 0),
-      "--progress-ms", String(logEveryMs),
-      "--batch-size", String(gpuBatchSize),
+      "--bits", String(challenge.difficulty_bits),
+      "--nonce", state.mining?.nonce || "0",
+      "--log-every-ms", String(logEveryMs),
     ];
+    if (args["gpu-batch"]) minerArgs.push("--batch-size", String(args["gpu-batch"]));
     if (args["gpu-local-size"]) minerArgs.push("--local-size", String(args["gpu-local-size"]));
     if (args["gpu-platform"]) minerArgs.push("--platform-index", String(args["gpu-platform"]));
     if (args["gpu-device"]) minerArgs.push("--device-index", String(args["gpu-device"]));
 
     const child = spawn(GPU_MINER, minerArgs, { windowsHide: true });
-
+    let solution = null;
     let buffer = "";
+
     child.stdout.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
+      buffer += chunk.toString();
       while (buffer.includes("\n")) {
-        const idx = buffer.indexOf("\n");
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
+        const line = buffer.slice(0, buffer.indexOf("\n")).trim();
+        buffer = buffer.slice(buffer.indexOf("\n") + 1);
         if (!line) continue;
-        let message;
-        try {
-          message = JSON.parse(line);
-        } catch {
+        const msg = tryJson(line);
+        if (msg) {
+          if (msg.type === "solution") {
+            solution = msg;
+          } else if (msg.type === "progress") {
+            state.mining = { ...state.mining, nonce: msg.nonce, hashes: msg.hashes };
+            saveState(stateFile, state);
+          }
+        } else {
           log("warn", "gpu miner emitted non-json line", { line });
-          continue;
-        }
-        if (message.type === "progress") {
-          const hashes = BigInt(message.hashes || "0");
-          const seconds = Math.max(1, (Date.now() - started) / 1000);
-          const rate = Number(hashes) / seconds;
-          state.mining = {
-            challenge_id: challenge.challenge_id,
-            nonce: message.nonce,
-            hashes: hashes.toString(),
-            difficulty_bits: difficulty,
-            workers: workerCount,
-            engine: "gpu",
-            gpu_batch_size: message.batch_size,
-            gpu_local_size: message.local_size,
-            gpu_device: message.device,
-          };
-          saveState(stateFile, state);
-          log("info", "mining", {
-            hashes: hashes.toString(),
-            nonce: message.nonce,
-            workers: workerCount,
-            engine: "gpu",
-            device: message.device,
-            batch_size: message.batch_size,
-            local_size: message.local_size,
-            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-          });
-        }
-        if (message.type === "found") {
-          settled = true;
-          const hashes = BigInt(message.hashes || "0");
-          const seconds = Math.max(0.001, (Date.now() - started) / 1000);
-          const rate = Number(hashes) / seconds;
-          state.mining = {
-            ...state.mining,
-            nonce: message.solution_nonce,
-            hashes: message.hashes,
-            found_at: new Date().toISOString(),
-            workers: workerCount,
-            engine: "gpu",
-            gpu_batch_size: message.batch_size,
-            gpu_local_size: message.local_size,
-            gpu_device: message.device,
-          };
-          saveState(stateFile, state);
-          resolve({
-            solution_nonce: message.solution_nonce,
-            hashes: message.hashes,
-            digest: message.digest,
-            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
-            elapsed_ms: Date.now() - started,
-          });
-        }
-        if (message.type === "expired") {
-          settled = true;
-          const err = new Error("challenge expired before a solution was found");
-          err.code = "CHALLENGE_EXPIRED";
-          err.retryable = true;
-          reject(err);
         }
       }
     });
 
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
 
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      if (settled) return;
-      if (code === 0) return;
-      reject(new Error(`gpu miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+    child.on("close", (code) => {
+      if (code === 0 && solution) {
+        const elapsed = Date.now() - started;
+        resolve({
+          ...solution,
+          speed: Math.round(Number(solution.hashes) / (elapsed / 1000)),
+          elapsed_ms: elapsed,
+        });
+      } else {
+        reject(new Error(`gpu miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+      }
     });
   });
 }
 
 async function promptLine(label) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => rl.question(label, (answer) => {
-    rl.close();
-    resolve(answer.trim());
-  }));
+  return new Promise((resolve) => {
+    rl.question(label, (line) => {
+      rl.close();
+      resolve(line.trim());
+    });
+  });
 }
 
 async function main() {
@@ -1218,6 +1028,12 @@ async function main() {
         await sleep(delay);
       }
     }
+
+    // Start Telegram update checker in background
+    if (TELEGRAM_BOT_TOKEN) {
+      setInterval(() => checkTelegramUpdates(client, target, minted), 10000);
+    }
+
     while (minted < target) {
       let challenge = client.state.challenge;
       const challengeExpiresAt = challenge?.expires_at ? Date.parse(challenge.expires_at) : null;
@@ -1299,7 +1115,7 @@ async function main() {
             log("info", "magic link requested, waiting for email...");
             
             let magicLink = null;
-            for (let i = 0; i < 12; i++) { // Wait up to 2 minutes
+            for (let i = 0; i < 12; i++) {
               await sleep(10000);
               magicLink = await findMagicLinkInGmail();
               if (magicLink) break;
@@ -1312,7 +1128,7 @@ async function main() {
             const me = await client.api("GET", "/me");
             log("success", "auto-login successful", me);
             await sendTelegramAlert(`✅ <b>Auto-Login Berhasil, Master!</b>\n\nSesi telah diperbarui otomatis. Mining dilanjutkan!`);
-            return; // Retry the failed request
+            continue;
           } catch (loginErr) {
             log("error", "auto-login failed", { error: loginErr.message });
             await sendTelegramAlert(`❌ <b>Auto-Login Gagal, Master!</b>\n\n<b>Pesan:</b> ${loginErr.message}\nMiner akan mencoba lagi dalam 1 jam.`);
@@ -1357,7 +1173,7 @@ Options:
   --verbose`);
 }
 
-  main().catch(async (err) => {
+main().catch(async (err) => {
   log("error", err.message, { code: err.code, status: err.status });
   await sendTelegramAlert(`❌ <b>Waduh Master, Ada Error!</b>\n\n<b>Pesan:</b> ${err.message}\n<b>Code:</b> ${err.code || "N/A"}`);
   process.exitCode = 1;
