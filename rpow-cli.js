@@ -102,7 +102,8 @@ async function checkTelegramUpdates(client, target, minted) {
       const text = message.text.toLowerCase();
       if (text === "/status") {
         const me = await client.api("GET", "/me").catch(() => ({ email: "Unknown", balance: 0 }));
-        await sendTelegramAlert(`📊 <b>Status Miner:</b>\n\n<b>Email:</b> ${me.email}\n<b>Balance:</b> ${me.balance}\n<b>Progress:</b> ${minted}/${target}`);
+        const currentMinted = client.state.minted_count || minted;
+        await sendTelegramAlert(`📊 <b>Status Miner:</b>\n\n<b>Email:</b> ${me.email}\n<b>Balance:</b> ${me.balance} RPOW\n<b>Progress:</b> ${currentMinted}/${target}\n<b>Engine:</b> ${process.env.RPOW_ENGINE || "node"}`);
       } else if (text === "/stop") {
         await sendTelegramAlert("🛑 <b>Mining dihentikan oleh Master!</b>");
         process.exit(0);
@@ -1105,6 +1106,7 @@ async function main() {
           solution_nonce: solution.solution_nonce,
         });
         minted += 1;
+        client.state.minted_count = minted;
         client.state.last_mint = result;
         client.state.challenge = null;
         client.state.mining = null;
