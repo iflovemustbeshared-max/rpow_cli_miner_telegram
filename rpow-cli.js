@@ -123,12 +123,24 @@ const DEFAULT_INDEX = path.join(__dirname, "index.js");
 const DEFAULT_STATE = path.join(__dirname, ".rpow-cli-state.json");
 const MINER_WORKER = path.join(__dirname, "rpow-miner-worker.js");
 const IS_WINDOWS = os.platform() === "win32";
-let NATIVE_MINER = path.join(__dirname, IS_WINDOWS ? "rpow-native-miner.exe" : "rpow-native-miner");
-if (!fs.existsSync(NATIVE_MINER)) {
-  const alt = path.join(__dirname, IS_WINDOWS ? "rpow-native-miner" : "rpow-native-miner.exe");
-  if (fs.existsSync(alt)) NATIVE_MINER = alt;
+
+// Robust binary path detection
+function getBinaryPath(name) {
+  const paths = [
+    path.join(__dirname, name),
+    path.join(__dirname, name + ".exe"),
+    path.join("/app", name),
+    path.join("/app", name + ".exe")
+  ];
+  for (const p of paths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return path.join(__dirname, IS_WINDOWS ? name + ".exe" : name);
 }
-const GPU_MINER = path.join(__dirname, IS_WINDOWS ? "rpow-gpu-miner.exe" : "rpow-gpu-miner");
+
+const NATIVE_MINER = getBinaryPath("rpow-native-miner");
+const GPU_MINER = getBinaryPath("rpow-gpu-miner");
+
 const SAFE_HOSTS = new Set([
   "api.rpow2.com",
   "rpow2.com",
@@ -513,255 +525,182 @@ function connectHttpsTunnel(url, proxy, signal) {
   });
 }
 
-function nodeRequest(url, { method, headers, body, signal, proxy }) {
-  return new Promise(async (resolve, reject) => {
-    let req;
+function nodeRequest(url, { method, headers, body, proxy, signal, timeout }) {
+  return new Promise((resolve, reject) => {
+    const isHttps = url.protocol === "https:";
+    const agent = isHttps ? https : http;
+    const options = {
+      method,
+      headers,
+      signal,
+      timeout,
+    };
+
     let settled = false;
-
-    function fail(err) {
+    function finish(res, bodyText) {
       if (settled) return;
       settled = true;
-      signal?.removeEventListener?.("abort", onAbort);
-      reject(err);
+      resolve(responseFromIncomingMessage(res, bodyText));
     }
 
-    function succeed(value) {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener?.("abort", onAbort);
-      resolve(value);
-    }
+    async function start() {
+      try {
+        if (proxy && isHttps) {
+          options.createConnection = (opts, cb) => {
+            connectHttpsTunnel(url, proxy, signal).then((s) => cb(null, s), cb);
+          };
+        } else if (proxy) {
+          options.host = proxy.host;
+          options.port = proxy.port;
+          options.path = url.href;
+          const auth = proxyAuthHeader(proxy);
+          if (auth) {
+            options.headers = { ...options.headers, "Proxy-Authorization": auth };
+          }
+        }
 
-    function attachResponse(reqInstance) {
-      req = reqInstance;
-      req.on("error", fail);
-      req.on("response", (res) => {
-        const chunks = [];
-        res.on("data", (chunk) => chunks.push(chunk));
-        res.on("end", () => {
-          succeed(responseFromIncomingMessage(res, Buffer.concat(chunks).toString("utf8")));
+        const req = agent.request(proxy ? options : url, options, (res) => {
+          let text = "";
+          res.on("data", (chunk) => { text += chunk.toString(); });
+          res.on("end", () => finish(res, text));
         });
-        res.on("error", fail);
-      });
-      if (body !== undefined) req.write(body);
-      req.end();
-    }
-
-    function onAbort() {
-      const err = new Error("This operation was aborted");
-      err.name = "AbortError";
-      err.code = 20;
-      req?.destroy(err);
-      fail(err);
-    }
-
-    signal?.addEventListener?.("abort", onAbort, { once: true });
-    try {
-      if (!proxy) {
-        const transport = url.protocol === "https:" ? https : http;
-        attachResponse(transport.request(url, { method, headers }));
-        return;
+        req.on("error", (err) => {
+          if (!settled) reject(err);
+        });
+        req.on("timeout", () => {
+          req.destroy();
+          const err = new Error("request timeout");
+          err.code = "ETIMEDOUT";
+          if (!settled) reject(err);
+        });
+        if (body) req.write(body);
+        req.end();
+      } catch (err) {
+        if (!settled) reject(err);
       }
-
-      const auth = proxyAuthHeader(proxy);
-      if (url.protocol === "http:") {
-        const proxyHeaders = { ...headers, host: url.host };
-        if (auth) proxyHeaders["proxy-authorization"] = auth;
-        attachResponse(http.request({
-          host: proxy.host,
-          port: proxy.port,
-          method,
-          path: url.href,
-          headers: proxyHeaders,
-        }));
-        return;
-      }
-
-      const secureSocket = await connectHttpsTunnel(url, proxy, signal);
-      attachResponse(https.request({
-        host: url.hostname,
-        port: Number(url.port || 443),
-        path: `${url.pathname}${url.search}`,
-        method,
-        headers: {
-          ...headers,
-          host: url.host,
-        },
-        agent: false,
-        createConnection: () => secureSocket,
-      }));
-    } catch (err) {
-      fail(err);
     }
+
+    start();
   });
 }
 
 class RpowClient {
-  constructor(options) {
-    this.apiOrigin = options.apiOrigin;
-    this.siteOrigin = options.siteOrigin;
-    this.stateFile = options.stateFile;
+  constructor(options = {}) {
+    this.apiOrigin = options.apiOrigin || DEFAULT_API_ORIGIN;
+    this.stateFile = options.stateFile || DEFAULT_STATE;
     this.state = loadState(this.stateFile);
-    this.timeoutMs = Number(process.env.RPOW_TIMEOUT || options.timeoutMs || 20000);
-    this.maxRetries = Number(options.retries || 5);
-    this.proxy = parseProxySpec(options.proxy || process.env.RPOW_PROXY || "");
+    this.proxy = parseProxySpec(options.proxy || process.env.RPOW_PROXY);
+    this.timeout = Number(options.timeout || 30000);
+    this.retries = Number(options.retries ?? 3);
   }
 
   save() {
-    this.state.updated_at = new Date().toISOString();
     saveState(this.stateFile, this.state);
   }
 
-  async request(method, urlOrPath, body, options = {}) {
-    const url = assertSafeUrl(urlOrPath, this.apiOrigin);
-    let attempt = 0;
-    while (true) {
-      attempt += 1;
+  async api(method, path, body = null, options = {}) {
+    const url = assertSafeUrl(path, this.apiOrigin);
+    const headers = {
+      ...options.headers,
+      "User-Agent": "rpow-cli/1.0",
+    };
+    const cookie = cookieHeader(this.state.cookies);
+    if (cookie) headers.Cookie = cookie;
+    
+    let bodyText = null;
+    if (body) {
+      headers["Content-Type"] = "application/json";
+      bodyText = JSON.stringify(body);
+    }
+
+    let lastErr = null;
+    for (let attempt = 0; attempt <= this.retries; attempt += 1) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-      const started = Date.now();
+      const timer = setTimeout(() => controller.abort(), this.timeout);
       try {
-        const headers = {
-          "accept": "application/json, text/plain, */*",
-          "origin": this.siteOrigin,
-          "referer": `${this.siteOrigin}/`,
-          "user-agent": "rpow-cli/1.0",
-        };
-        const cookies = cookieHeader(this.state.cookies);
-        if (cookies) headers.cookie = cookies;
-        let payload;
-        if (body !== undefined) {
-          headers["content-type"] = "application/json";
-          payload = JSON.stringify(body);
+        if (attempt > 0) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+          debugLog("retrying request", { method, path, attempt, delay_ms: delay });
+          await sleep(delay);
         }
-        debugLog("HTTP ->", {
+
+        const res = await nodeRequest(url, {
           method,
-          url: safeUrlForLog(url),
-          attempt,
-          has_body: body !== undefined,
-          has_cookie: Boolean(headers.cookie),
-          proxy: proxyLabel(this.proxy),
+          headers,
+          body: bodyText,
+          proxy: this.proxy,
+          signal: controller.signal,
+          timeout: this.timeout,
         });
-        const res = this.proxy
-          ? await nodeRequest(url, { method, headers, body: payload, signal: controller.signal, proxy: this.proxy })
-          : await fetch(url, {
-            method,
-            headers,
-            body: payload,
-            redirect: options.redirect || "manual",
-            signal: controller.signal,
-          });
-        storeSetCookies(this.state, responseSetCookies(res.headers));
-        this.save();
+
+        const setCookies = res.headers.getSetCookie();
+        if (setCookies.length > 0) {
+          storeSetCookies(this.state, setCookies);
+          this.save();
+        }
+
         const text = await res.text();
-        const parsed = text ? tryJson(text) : undefined;
-        debugLog("HTTP <-", {
-          method,
-          url: safeUrlForLog(url),
-          attempt,
-          status: res.status,
-          ms: Date.now() - started,
-          set_cookie: responseSetCookies(res.headers).length > 0,
-          retry_after_ms: retryAfterMs(res.headers),
-          proxy: proxyLabel(this.proxy),
-        });
-        if (res.status === 401 && options.allowUnauthorized !== true) {
-          const err = new Error(parsed?.message || "login required");
-          err.code = "UNAUTHORIZED";
+        if (!res.ok) {
+          const err = new Error(text || res.statusText);
           err.status = res.status;
-          throw err;
-        }
-        if (!res.ok && ![301, 302, 303, 307, 308].includes(res.status)) {
-          const err = new Error(parsed?.message || res.statusText || `HTTP ${res.status}`);
-          err.status = res.status;
-          err.code = parsed?.error;
-          err.retryable = [408, 425, 429, 500, 502, 503, 504].includes(res.status);
-          if (isAuthRequest(method, url) && looksLikeProviderRateLimit(err)) {
-            err.retryable = false;
-            err.cooldownMs = Math.max(retryAfterMs(res.headers) || 0, 60000);
-          }
+          err.retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
           err.retryAfterMs = retryAfterMs(res.headers);
+          try {
+            const data = JSON.parse(text);
+            if (data.code) err.code = data.code;
+            if (data.message) err.message = data.message;
+          } catch (e) {
+            // ignore
+          }
           throw err;
         }
-        return { res, data: parsed ?? text };
-      } catch (err) {
-        if (isAuthRequest(method, url) && looksLikeProviderRateLimit(err)) {
-          const waitSeconds = Math.ceil((err.cooldownMs || 60000) / 1000);
-          const e = new Error(`magic-link request is rate-limited; wait at least ${waitSeconds}s before running login again`);
-          e.code = err.code || "RATE_LIMITED";
-          e.status = err.status;
-          throw e;
+
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          return text;
         }
-        const retryable = err.retryable || isTransientNetworkError(err);
-        if (!retryable || attempt > this.maxRetries) throw err;
-        const backoff = Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
-        const delay = Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
-        log("warn", `request failed, retrying in ${delay}ms`, {
-          method,
-          url: safeUrlForLog(url),
-          attempt,
-          status: err.status,
-          code: errorCode(err),
-          error: err.message,
-        });
-        await sleep(delay);
+      } catch (err) {
+        lastErr = err;
+        if (isAbortLikeError(err)) {
+          debugLog("request aborted", { method, path });
+          throw err;
+        }
+        if (err.status === 401 || err.status === 403 || !isTransientNetworkError(err)) {
+          throw err;
+        }
       } finally {
-        clearTimeout(timeout);
+        clearTimeout(timer);
       }
     }
+    throw lastErr;
   }
 
-  async followMagicLink(link) {
-    let url = assertSafeUrl(link, this.apiOrigin).href;
-    for (let i = 0; i < 8; i += 1) {
-      const { res, data } = await this.request("GET", url, undefined, { redirect: "manual", allowUnauthorized: true });
-      const location = res.headers.get("location");
-      log("info", "magic-link step", { status: res.status, location: location ? safeUrlForLog(assertSafeUrl(location, url)) : null });
-      if (![301, 302, 303, 307, 308].includes(res.status) || !location) return data;
-      url = assertSafeUrl(location, url).href;
+  async followMagicLink(rawUrl) {
+    const url = new URL(rawUrl);
+    const res = await nodeRequest(url, {
+      method: "GET",
+      proxy: this.proxy,
+      timeout: this.timeout,
+    });
+    const setCookies = res.headers.getSetCookie();
+    if (setCookies.length > 0) {
+      storeSetCookies(this.state, setCookies);
+      this.save();
     }
-    throw new Error("too many redirects while completing magic link");
-  }
-
-  async api(method, pathName, body, options) {
-    return (await this.request(method, pathName, body, options)).data;
+    if (!res.ok) throw new Error(`magic link failed: ${res.status} ${res.statusText}`);
   }
 }
 
 function tryJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
+  try { return JSON.parse(text); } catch (e) { return null; }
 }
 
-function hexToBytes(hex) {
-  if (!/^[0-9a-f]*$/i.test(hex) || hex.length % 2 !== 0) throw new Error(`bad nonce_prefix hex: ${hex}`);
-  return Buffer.from(hex, "hex");
-}
-
-function nonceLe64(nonce) {
-  const out = Buffer.allocUnsafe(8);
-  let n = BigInt(nonce);
-  for (let i = 0; i < 8; i += 1) {
-    out[i] = Number(n & 0xffn);
-    n >>= 8n;
-  }
-  return out;
-}
-
-function defaultWorkerCount() {
-  return Math.max(1, os.cpus().length - 1);
-}
-
-function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workers) {
+async function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workers) {
   return new Promise((resolve, reject) => {
-    const started = Date.now();
     const active = new Set();
     let solution = null;
-    let totalHashes = BigInt(state.mining?.hashes || "0");
-    let lastLog = started;
+    const started = Date.now();
 
     function cleanup() {
       for (const w of active) w.terminate();
@@ -771,34 +710,21 @@ function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workers) 
     function onMessage(w, msg) {
       if (msg.type === "solution") {
         solution = msg;
-        const elapsed = Date.now() - started;
         cleanup();
         resolve({
-          ...msg,
-          hashes: (totalHashes + BigInt(msg.hashes)).toString(),
-          speed: Math.round(Number(totalHashes + BigInt(msg.hashes)) / (elapsed / 1000)),
-          elapsed_ms: elapsed,
+          solution_nonce: msg.nonce,
+          hashes: msg.hashes,
+          speed: msg.speed,
+          elapsed_ms: Date.now() - started,
         });
-        return;
-      }
-      if (msg.type === "progress") {
-        totalHashes += BigInt(msg.hashes);
-        const now = Date.now();
-        if (now - lastLog >= logEveryMs) {
-          const elapsed = now - started;
-          log("info", "mining progress", {
-            hashes: totalHashes.toString(),
-            speed: Math.round(Number(totalHashes) / (elapsed / 1000)),
-            elapsed_ms: elapsed,
-          });
-          lastLog = now;
-          state.mining = {
-            ...state.mining,
-            nonce: msg.nonce,
-            hashes: totalHashes.toString(),
-          };
-          saveState(stateFile, state);
-        }
+      } else if (msg.type === "progress") {
+        const totalHashes = Array.from(active).reduce((acc, worker) => acc + BigInt(worker.hashes || "0"), 0n);
+        const elapsed = (Date.now() - started) / 1000;
+        const speed = Number(totalHashes) / elapsed;
+        log("info", "mining progress", {
+          hashes: totalHashes.toString(),
+          speed: `${(speed / 1000000).toFixed(2)} MH/s`,
+        });
       }
     }
 
@@ -854,29 +780,41 @@ async function mineSolutionNative(challenge, state, stateFile, logEveryMs, worke
         if (msg) {
           if (msg.type === "solution") {
             solution = msg;
+            child.kill();
           } else if (msg.type === "progress") {
-            state.mining = { ...state.mining, nonce: msg.nonce, hashes: msg.hashes };
+            log("info", "mining progress", {
+              hashes: msg.hashes,
+              speed: `${(msg.speed / 1000000).toFixed(2)} MH/s`,
+            });
+            state.mining.nonce = msg.nonce;
+            state.mining.hashes = msg.hashes;
             saveState(stateFile, state);
           }
         } else {
-          log("warn", "native miner emitted non-json line", { line });
+          debugLog("miner output", line);
         }
       }
     });
 
-    let stderr = "";
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on("data", (chunk) => {
+      const line = chunk.toString().trim();
+      if (line) log("warn", "miner stderr", line);
+    });
 
-    child.on("close", (code) => {
-      if (code === 0 && solution) {
-        const elapsed = Date.now() - started;
+    child.on("error", (err) => {
+      reject(err);
+    });
+
+    child.on("exit", (code) => {
+      if (solution) {
         resolve({
-          ...solution,
-          speed: Math.round(Number(solution.hashes) / (elapsed / 1000)),
-          elapsed_ms: elapsed,
+          solution_nonce: solution.nonce,
+          hashes: solution.hashes,
+          speed: solution.speed,
+          elapsed_ms: Date.now() - started,
         });
       } else {
-        reject(new Error(`native miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+        reject(new Error(`native miner exited with code ${code}`));
       }
     });
   });
@@ -893,13 +831,12 @@ async function mineSolutionGpu(challenge, state, stateFile, logEveryMs, workers,
       "--prefix", challenge.nonce_prefix,
       "--bits", String(challenge.difficulty_bits),
       "--nonce", state.mining?.nonce || "0",
+      "--batch-size", String(args["gpu-batch"] || 1048576),
+      "--local-size", String(args["gpu-local-size"] || 256),
+      "--platform", String(args["gpu-platform"] || 0),
+      "--device", String(args["gpu-device"] || 0),
       "--log-every-ms", String(logEveryMs),
     ];
-    if (args["gpu-batch"]) minerArgs.push("--batch-size", String(args["gpu-batch"]));
-    if (args["gpu-local-size"]) minerArgs.push("--local-size", String(args["gpu-local-size"]));
-    if (args["gpu-platform"]) minerArgs.push("--platform-index", String(args["gpu-platform"]));
-    if (args["gpu-device"]) minerArgs.push("--device-index", String(args["gpu-device"]));
-
     const child = spawn(GPU_MINER, minerArgs, { windowsHide: true });
     let solution = null;
     let buffer = "";
@@ -914,70 +851,88 @@ async function mineSolutionGpu(challenge, state, stateFile, logEveryMs, workers,
         if (msg) {
           if (msg.type === "solution") {
             solution = msg;
+            child.kill();
           } else if (msg.type === "progress") {
-            state.mining = { ...state.mining, nonce: msg.nonce, hashes: msg.hashes };
+            log("info", "mining progress", {
+              hashes: msg.hashes,
+              speed: `${(msg.speed / 1000000).toFixed(2)} MH/s`,
+            });
+            state.mining.nonce = msg.nonce;
+            state.mining.hashes = msg.hashes;
             saveState(stateFile, state);
           }
         } else {
-          log("warn", "gpu miner emitted non-json line", { line });
+          debugLog("miner output", line);
         }
       }
     });
 
-    let stderr = "";
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on("data", (chunk) => {
+      const line = chunk.toString().trim();
+      if (line) log("warn", "miner stderr", line);
+    });
 
-    child.on("close", (code) => {
-      if (code === 0 && solution) {
-        const elapsed = Date.now() - started;
+    child.on("error", (err) => {
+      reject(err);
+    });
+
+    child.on("exit", (code) => {
+      if (solution) {
         resolve({
-          ...solution,
-          speed: Math.round(Number(solution.hashes) / (elapsed / 1000)),
-          elapsed_ms: elapsed,
+          solution_nonce: solution.nonce,
+          hashes: solution.hashes,
+          speed: solution.speed,
+          elapsed_ms: Date.now() - started,
         });
       } else {
-        reject(new Error(`gpu miner exited with code ${code}${stderr ? `: ${stderr.trim()}` : ""}`));
+        reject(new Error(`gpu miner exited with code ${code}`));
       }
     });
   });
 }
 
-async function promptLine(label) {
+function defaultWorkerCount() {
+  return Math.max(1, os.cpus().length - 1);
+}
+
+async function promptLine(query) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
-    rl.question(label, (line) => {
+    rl.question(query, (answer) => {
       rl.close();
-      resolve(line.trim());
+      resolve(answer.trim());
     });
   });
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  globalThis.__RPOW_VERBOSE__ = args.verbose === true;
-  const command = args._[0] || "help";
-  const discovered = discoverFromIndex(args.index || DEFAULT_INDEX);
+  const argv = process.argv.slice(2);
+  const args = parseArgs(argv);
+  const command = args._[0];
+
+  if (args.verbose) {
+    globalThis.__RPOW_VERBOSE__ = true;
+  }
+
   const client = new RpowClient({
-    apiOrigin: args.api || discovered.apiOrigin,
-    siteOrigin: args.site || DEFAULT_SITE_ORIGIN,
-    stateFile: args.state || DEFAULT_STATE,
-    timeoutMs: args.timeout || 20000,
-    retries: args.retries || 5,
+    stateFile: args.state,
     proxy: args.proxy,
+    timeout: args.timeout,
+    retries: args.retries,
   });
 
   if (command === "map") {
+    const discovered = discoverFromIndex(DEFAULT_INDEX);
     printApiMap(discovered);
     return;
   }
 
   if (command === "login") {
     const email = args.email || await promptLine("email: ");
-    await client.api("POST", "/auth/request", { email });
     client.state.email = email;
-    client.state.login_requested_at = new Date().toISOString();
     client.save();
-    log("success", "magic link requested; run complete-login with the emailed URL");
+    await client.api("POST", "/auth/request", { email });
+    log("success", "magic link sent to email; use 'complete-login --link ...' to finish");
     return;
   }
 
@@ -985,22 +940,22 @@ async function main() {
     const link = args.link || await promptLine("magic link: ");
     await client.followMagicLink(link);
     const me = await client.api("GET", "/me");
-    log("success", "session active", me);
+    log("success", "logged in", me);
     return;
   }
 
   if (command === "me") {
-    log("info", "me", await client.api("GET", "/me"));
+    log("success", "profile", await client.api("GET", "/me"));
     return;
   }
 
   if (command === "ledger") {
-    log("info", "ledger", await client.api("GET", "/ledger", undefined, { allowUnauthorized: true }));
+    log("success", "ledger", await client.api("GET", "/ledger"));
     return;
   }
 
   if (command === "activity") {
-    log("info", "activity", await client.api("GET", "/activity"));
+    log("success", "activity", await client.api("GET", "/activity"));
     return;
   }
 
@@ -1148,7 +1103,7 @@ async function main() {
             continue;
           } catch (loginErr) {
             log("error", "auto-login failed", { error: loginErr.message });
-            await sendTelegramAlert(`❌ <b>Auto-Login Gagal, Master!</b>\n\n<b>Pesan:</b> ${loginErr.message}\nMiner akan mencoba lagi dalam 1 jam.`);
+            await sendTelegramAlert(`❌ <b>Auto-Login Gagal, Master!</b>\n\n<b>Pesan:</b> ${loginErr.message}\nMiner akan mencoba lagi dalam 1 hour.`);
             await sleep(3600000);
             throw err;
           }
