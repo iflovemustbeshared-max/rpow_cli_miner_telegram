@@ -123,7 +123,11 @@ const DEFAULT_INDEX = path.join(__dirname, "index.js");
 const DEFAULT_STATE = path.join(__dirname, ".rpow-cli-state.json");
 const MINER_WORKER = path.join(__dirname, "rpow-miner-worker.js");
 const IS_WINDOWS = os.platform() === "win32";
-const NATIVE_MINER = path.join(__dirname, IS_WINDOWS ? "rpow-native-miner.exe" : "rpow-native-miner");
+let NATIVE_MINER = path.join(__dirname, IS_WINDOWS ? "rpow-native-miner.exe" : "rpow-native-miner");
+if (!fs.existsSync(NATIVE_MINER)) {
+  const alt = path.join(__dirname, IS_WINDOWS ? "rpow-native-miner" : "rpow-native-miner.exe");
+  if (fs.existsSync(alt)) NATIVE_MINER = alt;
+}
 const GPU_MINER = path.join(__dirname, IS_WINDOWS ? "rpow-gpu-miner.exe" : "rpow-gpu-miner");
 const SAFE_HOSTS = new Set([
   "api.rpow2.com",

@@ -13,6 +13,7 @@ WORKDIR /app
 COPY . .
 
 # Build native miner
+# We build it without .exe extension for Linux
 RUN gcc -O3 -march=x86-64 -pthread rpow-native-miner.c -o rpow-native-miner && chmod +x rpow-native-miner
 
 # Set environment variables (can be overridden in Railway)
