@@ -1,9 +1,6 @@
+.rpow-*.json
+rpow-*.json
 .rpow-cli-state.json
-.rpow-cli-state.*.json
-.rpow-cli-state.json.*.tmp
-.env
-*.log
-rpow-native-miner
-rpow-native-miner.exe
-node_modules/
-.DS_Store
+*.tmp
+*.zip
+image.png
