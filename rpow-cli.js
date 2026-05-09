@@ -3,14 +3,10 @@
 
 const crypto = require("crypto");
 const fs = require("fs");
-const http = require("http");
-const https = require("https");
-const net = require("net");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
 const { spawn } = require("child_process");
-const tls = require("tls");
 const { Worker } = require("worker_threads");
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -62,6 +58,7 @@ async function findMagicLinkInGmail() {
 
 async function sendTelegramAlert(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("Telegram notification skipped: Token or Chat ID missing.");
     return;
   }
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -84,68 +81,25 @@ async function sendTelegramAlert(message) {
   }
 }
 
-async function checkTelegramUpdates(client, target, minted) {
-  if (!TELEGRAM_BOT_TOKEN) return;
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`;
-  try {
-    const res = await fetch(url);
-    const data = await res.json();
-    if (data.ok && data.result.length > 0) {
-      const lastUpdate = data.result[data.result.length - 1];
-      const message = lastUpdate.message;
-      if (!message || !message.text) return;
-
-      // Simple rate limiting or state to avoid processing same message
-      if (client.lastTelegramUpdateId === lastUpdate.update_id) return;
-      client.lastTelegramUpdateId = lastUpdate.update_id;
-
-      const text = message.text.toLowerCase();
-      if (text === "/status") {
-        const me = await client.api("GET", "/me").catch(() => ({ email: "Unknown", balance: 0 }));
-        const currentMinted = client.state.minted_count || minted;
-        await sendTelegramAlert(`📊 <b>Status Miner:</b>\n\n<b>Email:</b> ${me.email}\n<b>Balance:</b> ${me.balance} RPOW\n<b>Progress:</b> ${currentMinted}/${target}\n<b>Engine:</b> ${process.env.RPOW_ENGINE || "node"}`);
-      } else if (text === "/stop") {
-        await sendTelegramAlert("🛑 <b>Mining dihentikan oleh Master!</b>");
-        process.exit(0);
-      } else if (text === "/balance") {
-        const me = await client.api("GET", "/me").catch(() => ({ balance: 0 }));
-        await sendTelegramAlert(`💰 <b>Balance Saat Ini:</b> ${me.balance} RPOW`);
-      }
-    }
-  } catch (err) {
-    // Silently fail for background checks
-  }
-}
-
 const DEFAULT_SITE_ORIGIN = "https://rpow2.com";
 const DEFAULT_API_ORIGIN = "https://api.rpow2.com";
 const DEFAULT_INDEX = path.join(__dirname, "index.js");
 const DEFAULT_STATE = path.join(__dirname, ".rpow-cli-state.json");
 const MINER_WORKER = path.join(__dirname, "rpow-miner-worker.js");
-const IS_WINDOWS = os.platform() === "win32";
-
-// Robust binary path detection
-function getBinaryPath(name) {
-  const paths = [
-    path.join(__dirname, name),
-    path.join(__dirname, name + ".exe"),
-    path.join("/app", name),
-    path.join("/app", name + ".exe")
+const NATIVE_MINER_CANDIDATES = process.platform === "win32"
+  ? [
+    path.join(__dirname, "rpow-native-miner.exe"),
+    path.join(__dirname, "rpow-native-miner"),
+  ]
+  : [
+    path.join(__dirname, "rpow-native-miner"),
+    path.join(__dirname, "rpow-native-miner.exe"),
   ];
-  for (const p of paths) {
-    if (fs.existsSync(p)) return p;
-  }
-  return path.join(__dirname, IS_WINDOWS ? name + ".exe" : name);
-}
-
-const NATIVE_MINER = getBinaryPath("rpow-native-miner");
-const GPU_MINER = getBinaryPath("rpow-gpu-miner");
-
+const GPU_MINER = path.join(__dirname, "rpow-gpu-miner");
 const SAFE_HOSTS = new Set([
   "api.rpow2.com",
   "rpow2.com",
   "www.rpow2.com",
-  "127.0.0.1.sslip.io",
 ]);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -239,18 +193,9 @@ function errorCode(err) {
   return err?.code || err?.cause?.code || err?.cause?.cause?.code;
 }
 
-function isAbortLikeError(err) {
-  const code = errorCode(err);
-  return err?.name === "AbortError"
-    || code === 20
-    || code === "20"
-    || err?.message === "This operation was aborted"
-    || /aborted/i.test(err?.message || "");
-}
-
 function isTransientNetworkError(err) {
   const code = errorCode(err);
-  return isAbortLikeError(err)
+  return err?.name === "AbortError"
     || err?.message === "fetch failed"
     || [
       "ECONNRESET",
@@ -267,63 +212,25 @@ function isTransientNetworkError(err) {
 }
 
 function loadState(file) {
-  let state = {};
-  
-  // Try loading from file first as it's more reliable
-  try {
-    if (fs.existsSync(file)) {
-      state = JSON.parse(fs.readFileSync(file, "utf8"));
-    }
-  } catch (err) {
-    log("warn", "Failed to parse state file, starting fresh", { file, error: err.message });
-  }
-
-  // Override with environment variable if present and valid
   if (process.env.RPOW_STATE_JSON) {
     try {
-      const envState = JSON.parse(process.env.RPOW_STATE_JSON);
-      state = { ...state, ...envState };
+      return JSON.parse(process.env.RPOW_STATE_JSON);
     } catch (err) {
       log("error", "Failed to parse RPOW_STATE_JSON environment variable", { error: err.message });
-      // If environment variable is invalid, we already have the file state or empty object
     }
   }
-  
-  return state;
-}
-
-function isRetryableStateWriteError(err) {
-  return ["EPERM", "EACCES", "EBUSY"].includes(err?.code);
-}
-
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    throw err;
+  }
 }
 
 function saveState(file, state) {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  const payload = `${JSON.stringify(state, null, 2)}\n`;
-  fs.writeFileSync(tmp, payload);
-  try {
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        fs.renameSync(tmp, file);
-        return;
-      } catch (err) {
-        if (!isRetryableStateWriteError(err) || attempt >= 5) throw err;
-        sleepSync(attempt * 25);
-      }
-    }
-  } catch (err) {
-    if (!isRetryableStateWriteError(err)) throw err;
-    fs.writeFileSync(file, payload);
-    try {
-      fs.unlinkSync(tmp);
-    } catch (unlinkErr) {
-      if (unlinkErr.code !== "ENOENT") debugLog("state tmp cleanup skipped", { file: tmp, code: unlinkErr.code });
-    }
-    log("warn", "state rename was blocked; fell back to direct overwrite", { file, code: err.code });
-  }
+  fs.writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  fs.renameSync(tmp, file);
 }
 
 function discoverFromIndex(indexFile) {
@@ -344,7 +251,7 @@ function printApiMap(discovered) {
   console.log("2. Open/fetch magic link -> server sets session cookie; CLI stores Set-Cookie values.");
   console.log("3. GET /me -> verifies session and balance.");
   console.log("4. POST /challenge -> { challenge_id, nonce_prefix, difficulty_bits }.");
-  console.log("5. Mine locally: SHA-256(nonce_prefix || uint64-le nonce), accept trailing zero bits >= difficulty_bits.");
+  console.log("5. Mine locally with the native C miner: SHA-256(nonce_prefix || uint64-le nonce), accept trailing zero bits >= difficulty_bits.");
   console.log("6. POST /mint { challenge_id, solution_nonce } -> mints/claims token.");
   console.log("7. Repeat from /challenge for more tokens; no separate commit/reveal endpoint is used by this site.");
   console.log("Endpoints found in index.js:");
@@ -355,22 +262,21 @@ function printApiMap(discovered) {
 function assertSafeUrl(rawUrl, apiOrigin) {
   const url = new URL(rawUrl, apiOrigin);
   if (!["https:", "http:"].includes(url.protocol)) throw new Error(`blocked non-http URL: ${rawUrl}`);
-  if (!SAFE_HOSTS.has(url.hostname)) throw new Error(`blocked non-RPOW host: ${url.hostname}`);
+  if (!SAFE_HOSTS.has(url.hostname)) throw new Error(`blocked host outside site/API allowlist: ${url.hostname}`);
   return url;
 }
 
-function cookieHeader(cookies) {
-  if (!cookies) return null;
-  const parts = Object.entries(cookies).map(([k, v]) => `${k}=${v}`);
-  return parts.length > 0 ? parts.join("; ") : null;
+function cookieHeader(cookies = {}) {
+  return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
-function storeSetCookies(state, setCookies) {
-  if (!state.cookies) state.cookies = {};
-  for (const header of setCookies) {
-    const first = header.split(";")[0];
+function storeSetCookies(state, setCookieHeaders) {
+  if (!setCookieHeaders || setCookieHeaders.length === 0) return;
+  state.cookies ||= {};
+  for (const header of setCookieHeaders) {
+    const first = header.split(";", 1)[0];
     const eq = first.indexOf("=");
-    if (eq < 0) continue;
+    if (eq <= 0) continue;
     const name = first.slice(0, eq).trim();
     const value = first.slice(eq + 1).trim();
     if (value) state.cookies[name] = value;
@@ -384,420 +290,418 @@ function responseSetCookies(headers) {
   return single ? [single] : [];
 }
 
-function parseProxySpec(spec) {
-  if (!spec) return null;
-  if (/^https?:\/\//i.test(spec)) {
-    const url = new URL(spec);
-    return {
-      protocol: url.protocol,
-      host: url.hostname,
-      port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-      username: decodeURIComponent(url.username || ""),
-      password: decodeURIComponent(url.password || ""),
-    };
-  }
-  const at = spec.indexOf("@");
-  const colon = spec.indexOf(":");
-  if (at <= 0 || colon <= 0 || colon > at) {
-    throw new Error(`bad proxy format: ${spec}`);
-  }
-  const host = spec.slice(0, colon);
-  const port = Number(spec.slice(colon + 1, at));
-  const creds = spec.slice(at + 1);
-  const credSep = creds.indexOf(":");
-  if (!host || !Number.isInteger(port) || port < 1 || credSep < 0) {
-    throw new Error(`bad proxy format: ${spec}`);
-  }
-  return {
-    protocol: "http:",
-    host,
-    port,
-    username: creds.slice(0, credSep),
-    password: creds.slice(credSep + 1),
-  };
-}
-
-function proxyLabel(proxy) {
-  return proxy ? `${proxy.host}:${proxy.port}` : null;
-}
-
-function proxyAuthHeader(proxy) {
-  if (!proxy?.username && !proxy?.password) return null;
-  return `Basic ${Buffer.from(`${proxy.username || ""}:${proxy.password || ""}`, "utf8").toString("base64")}`;
-}
-
-function makeHeadersBag(headers) {
-  const map = new Map();
-  for (const [key, value] of Object.entries(headers || {})) {
-    map.set(key.toLowerCase(), value);
-  }
-  return {
-    get(name) {
-      const value = map.get(String(name).toLowerCase());
-      if (Array.isArray(value)) return value.join(", ");
-      return value ?? null;
-    },
-    getSetCookie() {
-      const value = map.get("set-cookie");
-      if (!value) return [];
-      return Array.isArray(value) ? value : [value];
-    },
-  };
-}
-
-function responseFromIncomingMessage(res, bodyText) {
-  return {
-    status: res.statusCode || 0,
-    statusText: res.statusMessage || "",
-    ok: (res.statusCode || 0) >= 200 && (res.statusCode || 0) < 300,
-    headers: makeHeadersBag(res.headers),
-    text: async () => bodyText,
-  };
-}
-
-function connectHttpsTunnel(url, proxy, signal) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect(proxy.port, proxy.host);
-    let settled = false;
-    let buffer = Buffer.alloc(0);
-    const auth = proxyAuthHeader(proxy);
-
-    function fail(err) {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      reject(err);
-    }
-
-    function cleanup() {
-      socket.removeAllListeners("connect");
-      socket.removeAllListeners("data");
-      socket.removeAllListeners("error");
-      socket.removeAllListeners("close");
-      signal?.removeEventListener?.("abort", onAbort);
-    }
-
-    function onAbort() {
-      const err = new Error("This operation was aborted");
-      err.name = "AbortError";
-      err.code = 20;
-      fail(err);
-    }
-
-    socket.once("error", fail);
-    socket.once("close", () => {
-      if (!settled) fail(new Error("proxy tunnel closed before CONNECT completed"));
-    });
-    socket.once("connect", () => {
-      const lines = [
-        `CONNECT ${url.hostname}:${url.port || 443} HTTP/1.1`,
-        `Host: ${url.hostname}:${url.port || 443}`,
-        "Proxy-Connection: keep-alive",
-        "Connection: keep-alive",
-      ];
-      if (auth) lines.push(`Proxy-Authorization: ${auth}`);
-      socket.write(`${lines.join("\r\n")}\r\n\r\n`);
-    });
-    socket.on("data", (chunk) => {
-      if (settled) return;
-      buffer = Buffer.concat([buffer, chunk]);
-      const end = buffer.indexOf("\r\n\r\n");
-      if (end < 0) return;
-      const head = buffer.slice(0, end).toString("utf8");
-      const [statusLine] = head.split("\r\n");
-      const match = /^HTTP\/1\.\d\s+(\d+)/i.exec(statusLine);
-      if (!match) return fail(new Error(`bad proxy CONNECT response: ${statusLine}`));
-      const status = Number(match[1]);
-      if (status !== 200) return fail(new Error(`proxy CONNECT failed with HTTP ${status}`));
-      settled = true;
-      cleanup();
-      socket.removeAllListeners("data");
-      const leftover = buffer.slice(end + 4);
-      const secureSocket = tls.connect({
-        socket,
-        servername: url.hostname,
-      });
-      if (leftover.length > 0) secureSocket.unshift(leftover);
-      secureSocket.once("error", reject);
-      secureSocket.once("secureConnect", () => resolve(secureSocket));
-    });
-    signal?.addEventListener?.("abort", onAbort, { once: true });
-  });
-}
-
-function nodeRequest(url, { method, headers, body, proxy, signal, timeout }) {
-  return new Promise((resolve, reject) => {
-    const isHttps = url.protocol === "https:";
-    const agent = isHttps ? https : http;
-    const options = {
-      method,
-      headers,
-      signal,
-      timeout,
-    };
-
-    let settled = false;
-    function finish(res, bodyText) {
-      if (settled) return;
-      settled = true;
-      resolve(responseFromIncomingMessage(res, bodyText));
-    }
-
-    async function start() {
-      try {
-        if (proxy && isHttps) {
-          options.createConnection = (opts, cb) => {
-            connectHttpsTunnel(url, proxy, signal).then((s) => cb(null, s), cb);
-          };
-        } else if (proxy) {
-          options.host = proxy.host;
-          options.port = proxy.port;
-          options.path = url.href;
-          const auth = proxyAuthHeader(proxy);
-          if (auth) {
-            options.headers = { ...options.headers, "Proxy-Authorization": auth };
-          }
-        }
-
-        const req = agent.request(proxy ? options : url, options, (res) => {
-          let text = "";
-          res.on("data", (chunk) => { text += chunk.toString(); });
-          res.on("end", () => finish(res, text));
-        });
-        req.on("error", (err) => {
-          if (!settled) reject(err);
-        });
-        req.on("timeout", () => {
-          req.destroy();
-          const err = new Error("request timeout");
-          err.code = "ETIMEDOUT";
-          if (!settled) reject(err);
-        });
-        if (body) req.write(body);
-        req.end();
-      } catch (err) {
-        if (!settled) reject(err);
-      }
-    }
-
-    start();
-  });
-}
-
 class RpowClient {
-  constructor(options = {}) {
-    this.apiOrigin = options.apiOrigin || DEFAULT_API_ORIGIN;
-    this.siteOrigin = options.siteOrigin || DEFAULT_SITE_ORIGIN;
-    this.stateFile = options.stateFile || DEFAULT_STATE;
+  constructor(options) {
+    this.apiOrigin = options.apiOrigin;
+    this.siteOrigin = options.siteOrigin;
+    this.stateFile = options.stateFile;
     this.state = loadState(this.stateFile);
-    this.proxy = parseProxySpec(options.proxy || process.env.RPOW_PROXY);
-    this.timeout = Number(options.timeout || 30000);
-    this.retries = Number(options.retries ?? 3);
+    this.timeoutMs = Number(process.env.RPOW_TIMEOUT || options.timeoutMs || 20000);
+    this.maxRetries = Number(options.retries || 5);
   }
 
   save() {
+    this.state.updated_at = new Date().toISOString();
     saveState(this.stateFile, this.state);
   }
 
-  async api(method, path, body = null, options = {}) {
-    const url = assertSafeUrl(path, this.apiOrigin);
-    const headers = {
-      ...options.headers,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Accept": "application/json, text/plain, */*",
-      "Origin": this.siteOrigin,
-      "Referer": `${this.siteOrigin}/`,
-      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      "sec-ch-ua-mobile": "?0",
-      "sec-ch-ua-platform": '"Windows"',
-      "sec-fetch-dest": "empty",
-      "sec-fetch-mode": "cors",
-      "sec-fetch-site": "same-site",
-    };
-    const cookie = cookieHeader(this.state.cookies);
-    if (cookie) headers.Cookie = cookie;
-    
-    let bodyText = null;
-    if (body) {
-      headers["Content-Type"] = "application/json";
-      bodyText = JSON.stringify(body);
-    }
-
-    let lastErr = null;
-    for (let attempt = 0; attempt <= this.retries; attempt += 1) {
+  async request(method, urlOrPath, body, options = {}) {
+    const url = assertSafeUrl(urlOrPath, this.apiOrigin);
+    const maxRetries = options.maxRetries ?? this.maxRetries;
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeout);
+      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+      const started = Date.now();
       try {
-        if (attempt > 0) {
-          const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
-          debugLog("retrying request", { method, path, attempt, delay_ms: delay });
-          await sleep(delay);
+        const headers = {
+          "accept": "application/json, text/plain, */*",
+          "origin": this.siteOrigin,
+          "referer": `${this.siteOrigin}/`,
+          "user-agent": "rpow-cli/1.0",
+        };
+        const cookies = cookieHeader(this.state.cookies);
+        if (cookies) headers.cookie = cookies;
+        let payload;
+        if (body !== undefined) {
+          headers["content-type"] = "application/json";
+          payload = JSON.stringify(body);
         }
-
-        const res = await nodeRequest(url, {
+        debugLog("HTTP ->", {
+          method,
+          url: safeUrlForLog(url),
+          attempt,
+          has_body: body !== undefined,
+          has_cookie: Boolean(headers.cookie),
+        });
+        const res = await fetch(url, {
           method,
           headers,
-          body: bodyText,
-          proxy: this.proxy,
+          body: payload,
+          redirect: options.redirect || "manual",
           signal: controller.signal,
-          timeout: this.timeout,
         });
-
-        const setCookies = res.headers.getSetCookie();
-        if (setCookies.length > 0) {
-          storeSetCookies(this.state, setCookies);
-          this.save();
-        }
-
+        storeSetCookies(this.state, responseSetCookies(res.headers));
+        this.save();
         const text = await res.text();
-        if (!res.ok) {
-          const err = new Error(text || res.statusText);
+        const parsed = text ? tryJson(text) : undefined;
+        debugLog("HTTP <-", {
+          method,
+          url: safeUrlForLog(url),
+          attempt,
+          status: res.status,
+          ms: Date.now() - started,
+          set_cookie: responseSetCookies(res.headers).length > 0,
+          retry_after_ms: retryAfterMs(res.headers),
+        });
+        if (res.status === 401 && options.allowUnauthorized !== true) {
+          const err = new Error(parsed?.message || "login required");
+          err.code = "UNAUTHORIZED";
           err.status = res.status;
-          err.retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
-          err.retryAfterMs = retryAfterMs(res.headers);
-          try {
-            const data = JSON.parse(text);
-            if (data.code) err.code = data.code;
-            if (data.message) err.message = data.message;
-          } catch (e) {
-            // ignore
+          throw err;
+        }
+        if (!res.ok && ![301, 302, 303, 307, 308].includes(res.status)) {
+          const err = new Error(parsed?.message || res.statusText || `HTTP ${res.status}`);
+          err.status = res.status;
+          err.code = parsed?.error;
+          err.retryable = [408, 425, 429, 500, 502, 503, 504].includes(res.status);
+          if (isAuthRequest(method, url) && looksLikeProviderRateLimit(err)) {
+            err.retryable = false;
+            err.cooldownMs = Math.max(retryAfterMs(res.headers) || 0, 60000);
           }
+          err.retryAfterMs = retryAfterMs(res.headers);
           throw err;
         }
-
-        try {
-          return JSON.parse(text);
-        } catch (e) {
-          return text;
-        }
+        return { res, data: parsed };
       } catch (err) {
-        lastErr = err;
-        if (isAbortLikeError(err)) {
-          debugLog("request aborted", { method, path });
-          throw err;
+        if (isAuthRequest(method, url) && looksLikeProviderRateLimit(err)) {
+          const waitSeconds = Math.ceil((err.cooldownMs || 60000) / 1000);
+          const e = new Error(`magic-link request is rate-limited; wait at least ${waitSeconds}s before running login again`);
+          e.code = err.code || "RATE_LIMITED";
+          e.status = err.status;
+          throw e;
         }
-        if (err.status === 401 || err.status === 403 || !isTransientNetworkError(err)) {
-          throw err;
-        }
+        const retryable = err.retryable || isTransientNetworkError(err);
+        if (!retryable || attempt > maxRetries) throw err;
+        const backoff = Math.min(30000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
+        const delay = Math.max(backoff, Math.min(err.retryAfterMs || 0, 60000));
+        log("warn", `request failed, retrying in ${delay}ms`, {
+          method,
+          url: safeUrlForLog(url),
+          attempt,
+          status: err.status,
+          code: errorCode(err),
+          error: err.message,
+        });
+        await sleep(delay);
       } finally {
-        clearTimeout(timer);
+        clearTimeout(timeout);
       }
     }
-    throw lastErr;
   }
 
-  async followMagicLink(rawUrl) {
-    const url = new URL(rawUrl);
-    const res = await nodeRequest(url, {
-      method: "GET",
-      proxy: this.proxy,
-      timeout: this.timeout,
-    });
-    const setCookies = res.headers.getSetCookie();
-    if (setCookies.length > 0) {
-      storeSetCookies(this.state, setCookies);
-      this.save();
+  async followMagicLink(link) {
+    let url = assertSafeUrl(link, this.apiOrigin).href;
+    for (let i = 0; i < 8; i += 1) {
+      const { res, data } = await this.request("GET", url, undefined, { redirect: "manual", allowUnauthorized: true });
+      const location = res.headers.get("location");
+      log("info", "magic-link step", { status: res.status, location: location ? safeUrlForLog(assertSafeUrl(location, url)) : null });
+      if (![301, 302, 303, 307, 308].includes(res.status) || !location) return data;
+      url = assertSafeUrl(location, url).href;
     }
-    if (!res.ok) throw new Error(`magic link failed: ${res.status} ${res.statusText}`);
+    throw new Error("too many redirects while completing magic link");
+  }
+
+  async api(method, pathName, body, options) {
+    return (await this.request(method, pathName, body, options)).data;
   }
 }
 
 function tryJson(text) {
-  try { return JSON.parse(text); } catch (e) { return null; }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
-async function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workers) {
+function hexToBytes(hex) {
+  if (!/^[0-9a-f]*$/i.test(hex) || hex.length % 2 !== 0) throw new Error(`bad nonce_prefix hex: ${hex}`);
+  return Buffer.from(hex, "hex");
+}
+
+function nonceLe64(nonce) {
+  const out = Buffer.allocUnsafe(8);
+  let n = BigInt(nonce);
+  for (let i = 0; i < 8; i += 1) {
+    out[i] = Number(n & 0xffn);
+    n >>= 8n;
+  }
+  return out;
+}
+
+function trailingZeroBits(buf) {
+  let bits = 0;
+  for (let i = buf.length - 1; i >= 0; i -= 1) {
+    const byte = buf[i];
+    if (byte === 0) {
+      bits += 8;
+      continue;
+    }
+    for (let bit = 0; bit < 8; bit += 1) {
+      if ((byte & (1 << bit)) === 0) bits += 1;
+      else return bits;
+    }
+  }
+  return bits;
+}
+
+function defaultWorkerCount() {
+  return Math.max(1, Math.min(os.cpus().length - 1, os.cpus().length, 8));
+}
+
+function nativeMinerPath() {
+  return NATIVE_MINER_CANDIDATES.find((file) => fs.existsSync(file)) || null;
+}
+
+function mineSolutionSingleThread(challenge, state, stateFile, logEveryMs) {
+  const prefix = hexToBytes(challenge.nonce_prefix);
+  const difficulty = Number(challenge.difficulty_bits);
+  const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
+  const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : null;
+  let nonce = BigInt(state.mining?.nonce || "0");
+  let hashes = BigInt(state.mining?.hashes || "0");
+  const started = Date.now();
+  let lastLog = started;
+  while (true) {
+    if (cutoffAt && Date.now() >= cutoffAt) {
+      const err = new Error("challenge expired before a solution was found");
+      err.code = "CHALLENGE_EXPIRED";
+      err.retryable = true;
+      throw err;
+    }
+    const digest = crypto.createHash("sha256").update(prefix).update(nonceLe64(nonce)).digest();
+    if (trailingZeroBits(digest) >= difficulty) {
+      state.mining = { ...state.mining, nonce: nonce.toString(), hashes: hashes.toString(), found_at: new Date().toISOString() };
+      saveState(stateFile, state);
+      return { solution_nonce: nonce.toString(), hashes: hashes.toString(), digest: digest.toString("hex") };
+    }
+    nonce += 1n;
+    hashes += 1n;
+    const now = Date.now();
+    if (now - lastLog >= logEveryMs) {
+      const seconds = Math.max(1, (now - started) / 1000);
+      const rate = Number(hashes) / seconds;
+      state.mining = { challenge_id: challenge.challenge_id, nonce: nonce.toString(), hashes: hashes.toString(), difficulty_bits: difficulty };
+      saveState(stateFile, state);
+      log("info", "mining progress", {
+        hashes: hashes.toString(),
+        nonce: nonce.toString(),
+        rate_mhs: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+        rate_hps: Math.round(rate),
+      });
+      lastLog = now;
+    }
+  }
+}
+
+function mineSolutionParallel(challenge, state, stateFile, logEveryMs, workerCount) {
+  if (workerCount <= 1) return Promise.resolve(mineSolutionSingleThread(challenge, state, stateFile, logEveryMs));
+
   return new Promise((resolve, reject) => {
-    const active = new Set();
-    let solution = null;
+    const difficulty = Number(challenge.difficulty_bits);
+    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
+    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : null;
+    const startNonce = BigInt(state.mining?.nonce || "0");
     const started = Date.now();
+    const workers = [];
+    const workerStats = new Map();
+    let settled = false;
+    let lastSavedNonce = startNonce;
 
     function cleanup() {
-      for (const w of active) w.terminate();
-      active.clear();
+      for (const worker of workers) worker.terminate().catch(() => {});
     }
 
-    function onMessage(w, msg) {
-      if (msg.type === "solution") {
-        solution = msg;
-        cleanup();
-        resolve({
-          solution_nonce: msg.nonce,
-          hashes: msg.hashes,
-          speed: msg.speed,
-          elapsed_ms: Date.now() - started,
-        });
-      } else if (msg.type === "progress") {
-        const totalHashes = Array.from(active).reduce((acc, worker) => acc + BigInt(worker.hashes || "0"), 0n);
-        const elapsed = (Date.now() - started) / 1000;
-        const speed = Number(totalHashes) / elapsed;
-        log("info", "mining progress", {
-          hashes: totalHashes.toString(),
-          speed: `${(speed / 1000000).toFixed(2)} MH/s`,
-        });
+    function totalHashes() {
+      let total = 0n;
+      for (const stats of workerStats.values()) total += BigInt(stats.hashes || "0");
+      return total;
+    }
+
+    function maxNonce() {
+      let max = lastSavedNonce;
+      for (const stats of workerStats.values()) {
+        if (!stats.nonce) continue;
+        const n = BigInt(stats.nonce);
+        if (n > max) max = n;
       }
+      return max;
     }
 
-    for (let i = 0; i < workers; i += 1) {
-      const w = new Worker(MINER_WORKER, {
+    const progressTimer = setInterval(() => {
+      if (settled) return;
+      const hashes = totalHashes();
+      const seconds = Math.max(1, (Date.now() - started) / 1000);
+      const rate = Number(hashes) / seconds;
+      lastSavedNonce = maxNonce();
+      state.mining = {
+        challenge_id: challenge.challenge_id,
+        nonce: lastSavedNonce.toString(),
+        hashes: hashes.toString(),
+        difficulty_bits: difficulty,
+        workers: workerCount,
+      };
+      saveState(stateFile, state);
+      log("info", "mining progress", {
+        hashes: hashes.toString(),
+        nonce: lastSavedNonce.toString(),
+        workers: workerCount,
+        rate_mhs: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+        rate_hps: Math.round(rate),
+      });
+    }, logEveryMs);
+
+    for (let i = 0; i < workerCount; i += 1) {
+      const worker = new Worker(MINER_WORKER, {
         workerData: {
-          challenge_id: challenge.challenge_id,
-          nonce_prefix: challenge.nonce_prefix,
-          difficulty_bits: challenge.difficulty_bits,
-          start_nonce: (BigInt(state.mining?.nonce || "0") + BigInt(i)).toString(),
-          step: BigInt(workers).toString(),
+          noncePrefix: challenge.nonce_prefix,
+          difficultyBits: difficulty,
+          startNonce: (startNonce + BigInt(i)).toString(),
+          stride: String(workerCount),
+          cutoffAt,
+          progressEveryMs: Math.max(500, Math.floor(logEveryMs / 2)),
         },
       });
-      w.on("message", (msg) => onMessage(w, msg));
-      w.on("error", (err) => { cleanup(); reject(err); });
-      w.on("exit", (code) => {
-        active.delete(w);
-        if (code !== 0 && !solution) {
+      workers.push(worker);
+      workerStats.set(i, { hashes: "0", nonce: (startNonce + BigInt(i)).toString() });
+
+      worker.on("message", (message) => {
+        if (settled) return;
+        if (message.hashes !== undefined || message.nonce !== undefined) {
+          workerStats.set(i, {
+            hashes: message.hashes ?? workerStats.get(i)?.hashes ?? "0",
+            nonce: message.nonce ?? workerStats.get(i)?.nonce,
+          });
+        }
+        if (message.type === "found") {
+          settled = true;
+          clearInterval(progressTimer);
+          cleanup();
+          const hashes = totalHashes();
+          const seconds = Math.max(0.001, (Date.now() - started) / 1000);
+          const rate = Number(hashes) / seconds;
+          state.mining = {
+            ...state.mining,
+            nonce: message.solution_nonce,
+            hashes: hashes.toString(),
+            found_at: new Date().toISOString(),
+            workers: workerCount,
+          };
+          saveState(stateFile, state);
+          resolve({
+            solution_nonce: message.solution_nonce,
+            hashes: hashes.toString(),
+            digest: message.digest,
+            speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+            elapsed_ms: Date.now() - started,
+          });
+        }
+        if (message.type === "expired") {
+          settled = true;
+          clearInterval(progressTimer);
+          cleanup();
+          const err = new Error("challenge expired before a solution was found");
+          err.code = "CHALLENGE_EXPIRED";
+          err.retryable = true;
+          reject(err);
+        }
+      });
+
+      worker.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(progressTimer);
+        cleanup();
+        reject(err);
+      });
+
+      worker.on("exit", (code) => {
+        if (!settled && code !== 0) {
+          settled = true;
+          clearInterval(progressTimer);
           cleanup();
           reject(new Error(`miner worker exited with code ${code}`));
         }
       });
-      active.add(w);
     }
   });
 }
 
-async function mineSolutionNative(challenge, state, stateFile, logEveryMs, workers) {
-  if (!fs.existsSync(NATIVE_MINER)) {
-    throw new Error(`native miner not built: ${NATIVE_MINER}`);
+function mineSolutionNative(challenge, state, stateFile, logEveryMs, workerCount) {
+  const nativeMiner = nativeMinerPath();
+  if (!nativeMiner) {
+    throw new Error(`native miner not built; expected one of: ${NATIVE_MINER_CANDIDATES.join(", ")}`);
   }
   return new Promise((resolve, reject) => {
+    const difficulty = Number(challenge.difficulty_bits);
+    const expiresAt = challenge.expires_at ? Date.parse(challenge.expires_at) : null;
+    const cutoffAt = Number.isFinite(expiresAt) ? expiresAt - 5000 : 0;
+    const startNonce = BigInt(state.mining?.nonce || "0");
     const started = Date.now();
-    const args = [
-      "--prefix", challenge.nonce_prefix,
-      "--difficulty", String(challenge.difficulty_bits),
-      "--start", state.mining?.nonce || "0",
-      "--workers", String(workers),
-      "--progress-ms", String(logEveryMs),
-    ];
-    const child = spawn(NATIVE_MINER, args, { windowsHide: true });
+    let settled = false;
+    let stderr = "";
     let solution = null;
-    let buffer = "";
 
+    const child = spawn(nativeMiner, [
+      "--prefix", challenge.nonce_prefix,
+      "--difficulty", String(difficulty),
+      "--workers", String(workerCount),
+      "--start", startNonce.toString(),
+      "--cutoff-ms", String(cutoffAt ? cutoffAt - Date.now() : 0),
+      "--progress-ms", String(logEveryMs),
+    ], { windowsHide: true });
+
+    let buffer = "";
     child.stdout.on("data", (chunk) => {
-      buffer += chunk.toString();
+      buffer += chunk.toString("utf8");
       while (buffer.includes("\n")) {
-        const line = buffer.slice(0, buffer.indexOf("\n")).trim();
-        buffer = buffer.slice(buffer.indexOf("\n") + 1);
+        const idx = buffer.indexOf("\n");
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
         if (!line) continue;
-        const msg = tryJson(line);
-        if (msg) {
-          if (msg.type === "found" || msg.type === "solution") {
-            solution = msg;
-            child.kill();
-          } else if (msg.type === "progress") {
-            log("info", "mining progress", {
-              hashes: msg.hashes,
-              speed: `${(msg.speed / 1000000).toFixed(2)} MH/s`,
-            });
-            state.mining.nonce = msg.nonce;
-            state.mining.hashes = msg.hashes;
+        const message = tryJson(line);
+        if (message) {
+          if (message.type === "progress") {
+            const hashes = BigInt(message.hashes || "0");
+            const seconds = Math.max(1, (Date.now() - started) / 1000);
+            const rate = Number(hashes) / seconds;
+            state.mining = {
+              challenge_id: challenge.challenge_id,
+              nonce: message.nonce,
+              hashes: hashes.toString(),
+              difficulty_bits: difficulty,
+              workers: workerCount,
+              engine: "native",
+            };
             saveState(stateFile, state);
+            log("info", "mining", {
+              hashes: hashes.toString(),
+              nonce: message.nonce,
+              workers: workerCount,
+              engine: "native",
+              speed: `${(rate / 1_000_000).toFixed(2)} MH/s`,
+            });
+          } else if (message.type === "found" || message.type === "solution") {
+            solution = message;
+            child.kill();
+          } else if (message.type === "expired") {
+            settled = true;
+            const err = new Error("challenge expired before a solution was found");
+            err.code = "CHALLENGE_EXPIRED";
+            err.retryable = true;
+            reject(err);
           }
         } else {
           debugLog("miner output", line);
@@ -900,48 +804,54 @@ async function mineSolutionGpu(challenge, state, stateFile, logEveryMs, workers,
   });
 }
 
-function defaultWorkerCount() {
-  return Math.max(1, os.cpus().length - 1);
+async function promptLine(label) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(label, (answer) => {
+    rl.close();
+    resolve(answer.trim());
+  }));
 }
 
-async function promptLine(query) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(query, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
+async function checkTelegramUpdates(client, target, minted) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1`);
+    const data = await res.json();
+    if (data.ok && data.result.length > 0) {
+      const lastMsg = data.result[0].message;
+      if (lastMsg && lastMsg.text === "/status") {
+        await sendTelegramAlert(`📊 <b>Status Miner Master</b>\n\n<b>Minted:</b> ${minted}/${target}\n<b>Engine:</b> ${process.env.RPOW_ENGINE || "native"}\n<b>Workers:</b> ${process.env.RPOW_WORKERS || "1"}`);
+      }
+    }
+  } catch (err) {
+    // Silent fail for background check
+  }
 }
 
 async function main() {
-  const argv = process.argv.slice(2);
-  const args = parseArgs(argv);
-  const command = args._[0];
-
-  if (args.verbose) {
-    globalThis.__RPOW_VERBOSE__ = true;
-  }
-
+  const args = parseArgs(process.argv.slice(2));
+  globalThis.__RPOW_VERBOSE__ = args.verbose === true;
+  const command = args._[0] || "help";
+  const discovered = discoverFromIndex(args.index || DEFAULT_INDEX);
   const client = new RpowClient({
-    stateFile: args.state,
-    proxy: args.proxy,
-    timeout: args.timeout,
-    retries: args.retries,
+    apiOrigin: args.api || discovered.apiOrigin,
+    siteOrigin: args.site || DEFAULT_SITE_ORIGIN,
+    stateFile: args.state || DEFAULT_STATE,
+    timeoutMs: args.timeout || 20000,
+    retries: args.retries || 5,
   });
 
   if (command === "map") {
-    const discovered = discoverFromIndex(DEFAULT_INDEX);
     printApiMap(discovered);
     return;
   }
 
   if (command === "login") {
     const email = args.email || await promptLine("email: ");
-    client.state.email = email;
-    client.save();
     await client.api("POST", "/auth/request", { email });
-    log("success", "magic link sent to email; use 'complete-login --link ...' to finish");
+    client.state.email = email;
+    client.state.login_requested_at = new Date().toISOString();
+    client.save();
+    log("success", "magic link requested; run complete-login with the emailed URL");
     return;
   }
 
@@ -949,22 +859,22 @@ async function main() {
     const link = args.link || await promptLine("magic link: ");
     await client.followMagicLink(link);
     const me = await client.api("GET", "/me");
-    log("success", "logged in", me);
+    log("success", "session active", me);
     return;
   }
 
   if (command === "me") {
-    log("success", "profile", await client.api("GET", "/me"));
+    log("info", "me", await client.api("GET", "/me"));
     return;
   }
 
   if (command === "ledger") {
-    log("success", "ledger", await client.api("GET", "/ledger"));
+    log("info", "ledger", await client.api("GET", "/ledger", undefined, { allowUnauthorized: true }));
     return;
   }
 
   if (command === "activity") {
-    log("success", "activity", await client.api("GET", "/activity"));
+    log("info", "activity", await client.api("GET", "/activity"));
     return;
   }
 
@@ -986,12 +896,13 @@ async function main() {
 
   if (command === "mine" || command === "run") {
     const target = Number(args.count || args.tokens || 1);
-    const workers = Number(args.workers || defaultWorkerCount());
-    const engine = args.engine || (fs.existsSync(NATIVE_MINER) ? "native" : "node");
+    const workers = Number(args.workers || process.env.RPOW_WORKERS || defaultWorkerCount());
+    const engine = args.engine || process.env.RPOW_ENGINE || (nativeMinerPath() ? "native" : "node");
     const logEveryMs = Number(args["log-every-ms"] || (["native", "gpu"].includes(engine) ? 1000 : 5000));
     if (!Number.isInteger(workers) || workers < 1) throw new Error("--workers must be a positive integer");
     if (!["native", "node", "gpu"].includes(engine)) throw new Error("--engine must be native, gpu or node");
     let minted = 0;
+    
     while (true) {
       try {
         await client.api("GET", "/me");
@@ -999,8 +910,26 @@ async function main() {
       } catch (err) {
         if (err.code === "UNAUTHORIZED") {
           log("info", "No valid session on startup, attempting auto-login...");
-          // This will trigger the auto-login logic in the request method's catch block
-          await client.request("GET", "/me");
+          const email = client.state.email || process.env.RPOW_EMAIL;
+          if (!email) throw new Error("Email not found in state or environment for auto-login");
+          
+          await client.api("POST", "/auth/request", { email });
+          log("info", "magic link requested, waiting for email...");
+          
+          let magicLink = null;
+          for (let i = 0; i < 12; i++) {
+            await sleep(10000);
+            magicLink = await findMagicLinkInGmail();
+            if (magicLink) break;
+            log("info", `waiting for email... (${(i + 1) * 10}s)`);
+          }
+          
+          if (!magicLink) throw new Error("Magic link not found in Gmail after 2 minutes");
+          
+          await client.followMagicLink(magicLink);
+          const me = await client.api("GET", "/me");
+          log("success", "auto-login successful", me);
+          await sendTelegramAlert(`✅ <b>Auto-Login Berhasil, Master!</b>\n\nSesi telah diperbarui otomatis saat startup.`);
           break;
         }
         if (!(err.retryable || isTransientNetworkError(err))) throw err;
